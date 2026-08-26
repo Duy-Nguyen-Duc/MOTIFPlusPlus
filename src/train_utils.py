@@ -4,6 +4,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+# /dev/shm is 256 MB here and every in-flight dataloader batch lives in it
+# (~1.2 MB/sample), so build_loader bounds num_workers * prefetch_factor *
+# batch_size explicitly. The default "file_descriptor" sharing strategy is kept:
+# "file_system" does not move tensors out of shm and can race the consumer.
+
 from data.dataset import LeRobotSingleDataset
 from data.data_config import DATA_CONFIG_MAP
 from data.schema import EmbodimentTag
@@ -18,6 +23,37 @@ def set_seed(seed: int):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
+
+def rng_state():
+    """Capture every RNG a resume needs to continue the same stream.
+
+    Must survive torch.load(weights_only=True): numpy's state holds an ndarray
+    whose reconstructor is rejected there, so it is stored as a plain list.
+    """
+    import random, numpy as np, torch
+    np_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": (np_state[0], [int(x) for x in np_state[1]],
+                  int(np_state[2]), int(np_state[3]), float(np_state[4])),
+        "torch": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def load_rng_state(st):
+    """Restore what rng_state() captured. Returns False if the checkpoint has none."""
+    import random, numpy as np, torch
+    if not st:
+        return False
+    random.setstate(st["python"])
+    ns = st["numpy"]
+    np.random.set_state((ns[0], np.asarray(ns[1], dtype=np.uint32), ns[2], ns[3], ns[4]))
+    torch.set_rng_state(st["torch"].cpu() if hasattr(st["torch"], "cpu") else st["torch"])
+    if st.get("torch_cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([t.cpu() for t in st["torch_cuda"]])
+    return True
+
 def load_yaml(rel_path: str):
     from hydra.utils import to_absolute_path
     from omegaconf import OmegaConf
@@ -31,14 +67,30 @@ def build_dataset(dc):
     modift_tasks_num = dc["modifiy_tasks_num"]
     assert len(paths) == len(embs) == len(cfgs) == len(backs) == len(modift_tasks_num)
     datasets = []
+    # drop_video: stage 1 never reads batch["images"], so skip video decoding and
+    # its transforms entirely. Stages 2 and 3 consume the images; leave this off.
+    drop_video = dc.get("drop_video", False)
+
     for p, e, c, v, m in zip(paths, embs, cfgs, backs, modift_tasks_num):
         modiality_configs = DATA_CONFIG_MAP[c].modality_config()
         transforms = DATA_CONFIG_MAP[c].transform()
+        if drop_video:
+            video_keys = set(modiality_configs.pop("video").modality_keys)
+            kept = []
+            for t in transforms.transforms:
+                # Drop transforms whose only targets are video keys.
+                targets = set(getattr(t, "apply_to", []) or [])
+                if targets and targets <= video_keys:
+                    continue
+                if hasattr(t, "video_concat_order"):
+                    t.video_concat_order = []
+                kept.append(t)
+            transforms.transforms = kept
         # Adjust transform based on window size
         if "window_size" in dc:
             modiality_configs['action'].delta_indices = list(range(dc["window_size"]))
             transforms.transforms[-1].action_horizon = dc["window_size"]
-        datasets.append(LeRobotSingleDataset(
+        common = dict(
             dataset_path=p,
             modality_configs=modiality_configs,
             transforms=transforms,
@@ -46,7 +98,18 @@ def build_dataset(dc):
             video_backend=v,
             modifiy_tasks_num=m,
             balance_tasks=dc.get("balance_tasks", False),
-        ))
+        )
+        # Read pixels from the pre-decoded memmap cache (prextract_frames.py)
+        # instead of seeking mp4s per sample.
+        cache_root = dc.get("frame_cache_root")
+        if cache_root and not drop_video:
+            from data.frame_cache_dataset import FrameCachedLeRobotSingleDataset
+            datasets.append(FrameCachedLeRobotSingleDataset(
+                frame_cache_dir=os.path.join(cache_root, os.path.basename(str(p).rstrip("/"))),
+                **common,
+            ))
+        else:
+            datasets.append(LeRobotSingleDataset(**common))
     if dc.get("sampling_weights") is None:
         sw = [1.0 / len(datasets)] * len(datasets)
     else:
@@ -59,6 +122,12 @@ def build_loader(dataset, dc, device: str):
         normalize_images=dc["collator"]["normalize_images"],
         device="cpu" if device.startswith("cuda") else device
     )
+    # Bound the /dev/shm queue depth explicitly (see module header):
+    # num_workers * prefetch_factor * batch_size * 1.2 MB must stay under 256 MB.
+    # Defaults to torch's prefetch_factor of 2 when the key is absent.
+    loader_kwargs = {}
+    if dc["num_workers"] > 0 and dc.get("prefetch_factor") is not None:
+        loader_kwargs["prefetch_factor"] = dc["prefetch_factor"]
     data_loader = DataLoader(
         dataset,
         batch_size=dc["batch_size"],
@@ -68,6 +137,7 @@ def build_loader(dataset, dc, device: str):
         drop_last=dc["drop_last"],
         persistent_workers=dc["persistent_workers"] and dc["num_workers"] > 0,
         collate_fn=collator,
+        **loader_kwargs,
     )
     log.info(f"DataLoader: {len(data_loader)} batches, {len(data_loader.dataset)} samples per batch")
     return data_loader
@@ -91,7 +161,28 @@ class LinearWarmupLR(torch.optim.lr_scheduler._LRScheduler):
         lr = self.warmup_lr + alpha * (self.base_lr - self.warmup_lr)
         return [lr for _ in self.optimizer.param_groups]
 
-def build_optim_sched(model, oc, epochs: int, iters_per_epoch: int):
+def sched_steps_per_epoch(cfg_train, loader) -> int:
+    """Optimizer steps performed per epoch -- the unit the LR schedule is sized in.
+
+    ``cfg.train.iters_per_epoch`` is already an optimizer-step budget (the training
+    loops break on ``iters >= it``), so it passes through unchanged. Otherwise every
+    batch in the loader is consumed and the trailing partial accumulation window is
+    flushed, hence the ceiling division.
+    """
+    override = cfg_train.get("iters_per_epoch", 0)
+    if override:
+        return max(1, int(override))
+    ga = max(1, cfg_train.get("grad_accum_steps", 1))
+    return max(1, -(-len(loader) // ga))
+
+
+def build_optim_sched(model, oc, epochs: int, steps_per_epoch: int):
+    """Build the AdamW optimizer and its warmup+cosine schedule.
+
+    ``steps_per_epoch`` is counted in optimizer steps (``sched.step()`` runs once
+    per accumulation window, not per batch); derive it with
+    ``sched_steps_per_epoch()``.
+    """
     decay, no_decay, codebook_params = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -129,8 +220,7 @@ def build_optim_sched(model, oc, epochs: int, iters_per_epoch: int):
         betas=(oc["beta1"], oc["beta2"]),
         eps=oc["eps"],
     )
-    # total steps
-    total_iters = epochs * iters_per_epoch
+    total_iters = epochs * max(1, steps_per_epoch)
     T_total = int(total_iters * T_max_factor)
     warmup_iters = int(T_total * warmup_ratio)
     warmup_iters = max(1, warmup_iters)

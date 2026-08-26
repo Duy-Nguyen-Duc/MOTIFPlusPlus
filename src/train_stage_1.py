@@ -19,6 +19,9 @@ from train_utils import (
     build_dataset,
     build_loader,
     build_optim_sched,
+    sched_steps_per_epoch,
+    rng_state,
+    load_rng_state,
     count_params_B,
     get_grad_norm
 )
@@ -82,8 +85,9 @@ def main(cfg: DictConfig):
     )
     cfg.optim = cfg.optim.stage1
     
+    # Sized in OPTIMIZER steps, not batches -- see sched_steps_per_epoch.
     optim, sched = build_optim_sched(
-        model, cfg.optim, cfg.train.epochs, iters_per_epoch
+        model, cfg.optim, cfg.train.epochs, sched_steps_per_epoch(cfg.train, loader)
     )
 
     # Count model parameters
@@ -259,6 +263,20 @@ def main(cfg: DictConfig):
             if cfg.train.iters_per_epoch > 0 and iters >= cfg.train.iters_per_epoch:
                 break
 
+        # Flush the trailing partial accumulation window; otherwise its gradients
+        # are discarded by the zero_grad at the top of the next epoch.
+        if cfg.train.grad_accum_steps > 1 and (step + 1) % cfg.train.grad_accum_steps != 0:
+            if cfg.train.grad_clip_norm and cfg.train.grad_clip_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.train.grad_clip_norm
+                ).item()
+            else:
+                grad_norm = get_grad_norm(model)
+            optim.step()
+            optim.zero_grad(set_to_none=True)
+            if cfg.optim["T_max_factor"]:
+                sched.step()
+
         if not cfg.optim["T_max_factor"]:
             sched.step()
 
@@ -318,6 +336,9 @@ def main(cfg: DictConfig):
                 "model": model.state_dict(),
                 "optimizer": optim.state_dict(),
                 "scheduler": sched.state_dict(),
+                "global_iters": global_iters,
+                # RNG state lets a resume continue the same shuffle/augmentation stream.
+                "rng": rng_state(),
                 "cfg": OmegaConf.to_container(cfg, resolve=True),
             }
 

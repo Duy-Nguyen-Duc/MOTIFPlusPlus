@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Everything the evaluator must reproduce from how demo_data_processed was built.",
+    "Verified: applying gripper_range to the raw qpos columns reproduces the converted",
+    "observation.state[:,7] bit-for-bit (max|diff| <= 6e-7).",
+    "Derived from data/process/maniskill_to_lerobot.py --gripper_qpos_indices and",
+    "--gripper_norm dataset, and from the ManiSkill env defaults used at generation."
+  ],
+  "gripper_qpos_cols": {"panda": [7, 8], "xarm6": [6], "widowxai": [6, 7]},
+  "gripper_range":     {"panda": [0.0, 0.08],
+                        "xarm6": [-0.05223, 0.810008],
+                        "widowxai": [0.0, 0.088]},
+  "action_gripper_dims": {"panda": 1, "xarm6": 1, "widowxai": 2},
+  "render_resolution": 256,
+  "control_freq": 20,
+  "sim_freq": 100,
+  "fps": 20,
+  "task_instructions": {
+    "PushCube-v1": "Push the cube across the surface to the target location.",
+    "PlaceSphere-v1": "Pick up the sphere and place it precisely into the target.",
+    "PullCube-v1": "Pull the cube toward the target marker.",
+    "LiftPegUpright-v1": "Lift the peg and stand it upright.",
+    "PickCube-v1": "Pick up the cube.",
+    "StackCube-v1": "Stack the cube on top of the other cube."
+  }
+}

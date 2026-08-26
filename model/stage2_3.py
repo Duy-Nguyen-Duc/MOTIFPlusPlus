@@ -81,8 +81,59 @@ class MultimodalMotifPredictor(nn.Module):
         self.text_encoder.requires_grad_(False)
         self.lang_proj = nn.Linear(t5_dim, model_dim)
 
+        # sentence -> unpadded T5 last_hidden_state, keyed by (device, sentence).
+        # Plain dict so it stays out of state_dict().
+        self._text_cache = {}
+
+        # Frozen encoders stay in eval mode; see train().
+        self.dino_encoder.eval()
+        self.text_encoder.eval()
+
+    def train(self, mode: bool = True):
+        """Keep the frozen encoders in eval mode: requires_grad_(False) stops
+        gradients but not T5's dropout, which would make the text features
+        stochastic and uncacheable."""
+        super().train(mode)
+        self.dino_encoder.eval()
+        self.text_encoder.eval()
+        return self
+
     # Encode text
     def _encode_text(self, sentences: List[str], device = 'cuda'):
+        if self.text_encoder.training:
+            # Dropout live -> output is stochastic; do not cache a noise draw.
+            return self._encode_text_uncached(sentences, device)
+
+        cache = self._text_cache
+        dev_key = str(device)
+        missing = [s for s in dict.fromkeys(sentences) if (dev_key, s) not in cache]
+        if missing:
+            encoding = self.tokenizer(missing, return_tensors="pt", padding=True).to(device)
+            with torch.no_grad():
+                hidden = self.text_encoder(
+                    input_ids=encoding["input_ids"],
+                    attention_mask=encoding["attention_mask"],
+                ).last_hidden_state
+            lengths = encoding["attention_mask"].sum(dim=1).tolist()
+            for sentence, row, length in zip(missing, hidden, lengths):
+                # Store unpadded: a sentence's rows do not depend on the padding
+                # batch it was encoded with.
+                cache[(dev_key, sentence)] = row[:length].clone()
+
+        rows = [cache[(dev_key, s)] for s in sentences]
+        max_len = max(row.shape[0] for row in rows)
+        lang_emb = rows[0].new_zeros(len(rows), max_len, rows[0].shape[-1])
+        attention_mask = torch.zeros(
+            len(rows), max_len, dtype=torch.long, device=lang_emb.device
+        )
+        for i, row in enumerate(rows):
+            lang_emb[i, : row.shape[0]] = row
+            attention_mask[i, : row.shape[0]] = 1
+
+        # Padded rows stay zero; all consumers mask them out downstream.
+        return lang_emb, attention_mask
+
+    def _encode_text_uncached(self, sentences: List[str], device = 'cuda'):
         encoding = self.tokenizer(sentences, return_tensors="pt", padding=True).to(device)
         input_ids = encoding["input_ids"]
         attention_mask = encoding["attention_mask"]
@@ -105,6 +156,21 @@ class MultimodalMotifPredictor(nn.Module):
         emb = rearrange(emb, "(b t v) n d -> b (t v n) d", b=b, t=t, v=v)
         mask = torch.ones(b, emb.shape[1], dtype=torch.int64, device=emb.device)
         return emb, mask
+
+    # Frozen-encoder pass before any projection, split out so stage 3 can run
+    # the encoders once and share the result (see MotifRoboticPolicy.forward).
+    def encode_raw(self, batch: Dict[str, torch.Tensor]):
+        lang_emb, lang_mask = self._encode_text(batch["language"], device=batch["images"].device)
+        img_emb, img_mask = self._encode_image(batch["images"])
+        return lang_emb, lang_mask, img_emb, img_mask
+
+    def _encode_observation_from_raw(self, lang_emb, lang_mask, img_emb, img_mask):
+        lang_emb = self.lang_proj(lang_emb)
+        img_emb = self.vision_proj(img_emb)
+
+        obs_seq = torch.cat([lang_emb, img_emb], dim=1)
+        masks = torch.cat([lang_mask, img_mask], dim=1)
+        return obs_seq, masks
 
     # Encode observation (language + image)
     def _encode_observation(self, batch: Dict[str, torch.Tensor]):
@@ -135,6 +201,14 @@ class MultimodalMotifPredictor(nn.Module):
     @torch.no_grad()
     def get_key(self, batch: Dict[str, torch.Tensor], causal_attn: bool = False):
         obs_seq, masks = self._encode_observation(batch)
+        key_token = self.perceiver(obs_seq, masks)
+        return self.to_code_dim(key_token), obs_seq, masks
+
+    @torch.no_grad()
+    def get_key_from_raw(self, lang_emb, lang_mask, img_emb, img_mask):
+        obs_seq, masks = self._encode_observation_from_raw(
+            lang_emb, lang_mask, img_emb, img_mask
+        )
         key_token = self.perceiver(obs_seq, masks)
         return self.to_code_dim(key_token), obs_seq, masks
 
@@ -187,9 +261,10 @@ class MotifRoboticPolicy(nn.Module):
         t5_dim = 768
         self.lang_proj = nn.Linear(t5_dim, flow_matching_cfg['hidden_size'])
 
-    def get_observation_embedding(self, batch: Dict[str, torch.Tensor]):
-        lang_emb, lang_mask = self.mkl._encode_text(batch["language"], device=batch["images"].device)
-        img_emb, img_mask = self.mkl._encode_image(batch["images"])
+    def get_observation_embedding(self, batch: Dict[str, torch.Tensor], encoded=None):
+        if encoded is None:
+            encoded = self.mkl.encode_raw(batch)
+        lang_emb, lang_mask, img_emb, img_mask = encoded
 
         lang_emb = self.lang_proj(lang_emb)
         img_emb = self.vision_proj(img_emb)
@@ -198,11 +273,13 @@ class MotifRoboticPolicy(nn.Module):
         masks = torch.cat([lang_mask, img_mask], dim=1)
 
         return obs_seq, masks
-    
+
     def forward(self, batch: Dict[str, torch.Tensor], causal_attn: bool = False):
-        obs_emb, masks = self.get_observation_embedding(batch)
+        # One shared frozen-encoder pass for the policy branch and mkl's key branch.
+        encoded = self.mkl.encode_raw(batch)
+        obs_emb, masks = self.get_observation_embedding(batch, encoded=encoded)
         if self.add_latent_action:
-            key, _, _ = self.mkl.get_key(batch, causal_attn)
+            key, _, _ = self.mkl.get_key_from_raw(*encoded)
             latent_action, _, _ = self.mkl.vq_vae.vq.inference_forward(key)
         else:
             latent_action = None
@@ -226,9 +303,10 @@ class MotifRoboticPolicy(nn.Module):
 
     @torch.no_grad()
     def get_action(self, batch: Dict[str, torch.Tensor], causal_attn: bool = False):
-        obs_emb, masks = self.get_observation_embedding(batch)
+        encoded = self.mkl.encode_raw(batch)
+        obs_emb, masks = self.get_observation_embedding(batch, encoded=encoded)
         if self.add_latent_action:
-            key, _, _ = self.mkl.get_key(batch, causal_attn)
+            key, _, _ = self.mkl.get_key_from_raw(*encoded)
             latent_action, _, _ = self.mkl.vq_vae.vq.inference_forward(key)
         else:
             latent_action = None

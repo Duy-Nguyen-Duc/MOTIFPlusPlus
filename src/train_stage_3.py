@@ -1,4 +1,5 @@
 import os
+import glob
 import time
 import json
 import logging
@@ -17,6 +18,9 @@ from train_utils import (
     build_dataset,
     build_loader,
     build_optim_sched,
+    sched_steps_per_epoch,
+    rng_state,
+    load_rng_state,
     count_params_B,
     get_grad_norm
 )
@@ -66,8 +70,9 @@ def main(cfg: DictConfig):
         len(loader) if cfg.train.iters_per_epoch == 0 else cfg.train.iters_per_epoch
     )
     cfg.optim = cfg.optim.stage3
+    # Sized in OPTIMIZER steps, not batches -- see sched_steps_per_epoch.
     optim, sched = build_optim_sched(
-        model, cfg.optim, cfg.train.epochs, iters_per_epoch
+        model, cfg.optim, cfg.train.epochs, sched_steps_per_epoch(cfg.train, loader)
     )
 
     # Count model parameters
@@ -81,11 +86,50 @@ def main(cfg: DictConfig):
         )
 
     global_iters = 0
+    start_epoch = 1
+
+    # Resume support: checkpoints carry optimizer/scheduler/RNG so a resumed run
+    # continues the same schedule and data stream.
+    resume_from = cfg.train.get("resume_from", None)
+    if resume_from == "auto":
+        # last.pth is written every epoch and is always the newest state; the
+        # numbered checkpoints only start at skip_epochs.
+        last = os.path.join(out_dir, "last.pth")
+        if os.path.exists(last):
+            resume_from = last
+        else:
+            existing = sorted(glob.glob(os.path.join(out_dir, "epoch_*.pth")))
+            resume_from = existing[-1] if existing else None
+    if resume_from:
+        log.info(f"=> resuming from {resume_from}")
+        ck = torch.load(resume_from, map_location="cpu")
+        model.load_state_dict(ck["model"], strict=False)
+        if "optimizer" not in ck:
+            # Refuse to "resume" without optimizer state: that would restart the
+            # LR schedule at epoch 1 with warm weights.
+            raise RuntimeError(
+                f"{resume_from} has no optimizer state. Resuming from it would "
+                "restart the LR schedule at epoch 1 with pre-trained weights, "
+                "which is not a continuation. Delete it or train from scratch "
+                "into a fresh output_dir."
+            )
+        optim.load_state_dict(ck["optimizer"])
+        sched.load_state_dict(ck["scheduler"])
+        global_iters = ck.get("global_iters", 0)
+        start_epoch = ck["epoch"] + 1
+        restored = load_rng_state(ck.get("rng"))
+        log.info(f"=> resumed at epoch {start_epoch}, rng_restored={restored}")
+        if not restored:
+            log.warning("=> no RNG state in checkpoint: the shuffle and augmentation "
+                        "stream restarts, so this run is NOT equivalent to an "
+                        "uninterrupted one")
 
     # Train loop
-    for epoch in range(1, cfg.train.epochs + 1):
+    for epoch in range(start_epoch, cfg.train.epochs + 1):
         model.train()
-        total_loss, n_seen, iters = 0.0, 0, 0
+        # Kept on the GPU: a per-step .item() would sync the host every iteration.
+        total_loss = torch.zeros((), device=device)
+        n_seen, iters = 0, 0
         optim.zero_grad(set_to_none=True)
         t0 = time.time()
 
@@ -117,7 +161,7 @@ def main(cfg: DictConfig):
                 global_iters += 1
 
             bs = batch["state"].shape[0]
-            total_loss += raw_loss.item() * bs
+            total_loss += raw_loss.detach() * bs
             n_seen += bs
 
             if (
@@ -148,10 +192,24 @@ def main(cfg: DictConfig):
             if cfg.train.iters_per_epoch > 0 and iters >= cfg.train.iters_per_epoch:
                 break
 
+        # Flush the trailing partial accumulation window; otherwise its gradients
+        # are discarded by the zero_grad at the top of the next epoch.
+        if cfg.train.grad_accum_steps > 1 and (step + 1) % cfg.train.grad_accum_steps != 0:
+            if cfg.train.grad_clip_norm and cfg.train.grad_clip_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.train.grad_clip_norm
+                ).item()
+            else:
+                grad_norm = get_grad_norm(model)
+            optim.step()
+            optim.zero_grad(set_to_none=True)
+            if cfg.optim["T_max_factor"]:
+                sched.step()
+
         if not cfg.optim["T_max_factor"]:
             sched.step()
 
-        avg_loss = total_loss / max(1, n_seen)
+        avg_loss = total_loss.item() / max(1, n_seen)
         epoch_time = time.time() - t0
 
         epoch_payload = {
@@ -178,26 +236,35 @@ def main(cfg: DictConfig):
         is_after_skip = epoch >= cfg.train.skip_epochs
         is_checkpoint_interval = epoch % cfg.train.ckpt_interval == 0
         is_last_epoch = epoch == cfg.train.epochs
+
+        full_state = model.state_dict()
+        exclude_prefixes = [
+            "mkl.dino_encoder.",
+            "mkl.text_encoder."
+        ]
+        filtered_state = {
+            k: v for k, v in full_state.items()
+            if not any(k.startswith(prefix) for prefix in exclude_prefixes)
+        }
+        payload = {
+            "epoch": epoch,
+            "model": filtered_state,
+            "optimizer": optim.state_dict(),
+            "scheduler": sched.state_dict(),
+            "global_iters": global_iters,
+            "rng": rng_state(),
+            "cfg": OmegaConf.to_container(cfg, resolve=True),
+        }
+
+        # Rolling per-epoch checkpoint (numbered ones only start at skip_epochs).
+        # Temp-file + rename so a crash mid-write cannot leave a truncated file.
+        last_path = os.path.join(out_dir, "last.pth")
+        torch.save(payload, last_path + ".tmp")
+        os.replace(last_path + ".tmp", last_path)
+
         if is_after_skip and (is_checkpoint_interval or is_last_epoch):
             ckpt_path = os.path.join(out_dir, f"epoch_{epoch:04d}.pth")
-
-            full_state = model.state_dict()
-            exclude_prefixes = [
-                "mkl.dino_encoder.",
-                "mkl.text_encoder."
-            ]
-            filtered_state = {
-                k: v for k, v in full_state.items()
-                if not any(k.startswith(prefix) for prefix in exclude_prefixes)
-            }
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": filtered_state,
-                    "cfg": OmegaConf.to_container(cfg, resolve=True),
-                },
-                ckpt_path,
-            )
+            torch.save(payload, ckpt_path)
             log.info(f"=> saved {ckpt_path}")
 
             if wandb_run is not None and cfg.wandb.get("log_ckpt", False):

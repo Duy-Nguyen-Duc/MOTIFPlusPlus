@@ -149,16 +149,29 @@ class GR00TTransform(InvertibleModalityTransform):
             if modality not in grouped_keys:
                 grouped_keys[modality] = []
             grouped_keys[modality].append(key)
-        # Use video key to determine batch size.
-        video_ndim = data["video"].ndim
-        if video_ndim == 5:  # Interpret as [T, V, H, W, C]
-            is_batched = False
-            batch_size = 1
-        elif video_ndim == 6:  # Interpret as [B, T, V, H, W, C]
-            is_batched = True
-            batch_size = data["video"].shape[0]
+        # Use video key to determine batch size. Stage 1 can run without the video
+        # modality at all (it consumes only rel_state/progress/language/embodiment_id),
+        # in which case fall back to the state key, which is always present.
+        if "video" in data:
+            video_ndim = data["video"].ndim
+            if video_ndim == 5:  # Interpret as [T, V, H, W, C]
+                is_batched = False
+                batch_size = 1
+            elif video_ndim == 6:  # Interpret as [B, T, V, H, W, C]
+                is_batched = True
+                batch_size = data["video"].shape[0]
+            else:
+                raise ValueError(f"Unsupported video number of dimensions: {video_ndim}")
         else:
-            raise ValueError(f"Unsupported video number of dimensions: {video_ndim}")
+            state_ndim = data["state"].ndim
+            if state_ndim == 2:  # [T, D]
+                is_batched = False
+                batch_size = 1
+            elif state_ndim == 3:  # [B, T, D]
+                is_batched = True
+                batch_size = data["state"].shape[0]
+            else:
+                raise ValueError(f"Unsupported state number of dimensions: {state_ndim}")
 
         # Handle language
         if "language" in grouped_keys:
@@ -300,10 +313,15 @@ class GR00TTransform(InvertibleModalityTransform):
         transformed_data = {}
 
         # 1) Prepare video and language with vlm processing.
-        images = self._prepare_video(data)  # v t c h w
-        images = images.astype(np.uint8)
+        # Video is optional: stage 1 drops the modality entirely so the loader does
+        # not decode and augment frames it never reads (see build_dataset drop_video).
         language = self._prepare_language(data)
-        batch_data = {"images": images, "language": language}
+        if "video" in data:
+            images = self._prepare_video(data)  # v t c h w
+            images = images.astype(np.uint8)
+            batch_data = {"images": images, "language": language}
+        else:
+            batch_data = {"language": language}
         if self.eagle_processor is not None:
             vlm_outputs = self._apply_vlm_processing(batch_data)
         else:

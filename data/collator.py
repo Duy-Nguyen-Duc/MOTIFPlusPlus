@@ -45,7 +45,9 @@ class MOTIFCollator:
             if key in batch[0]:
                 out[key] = self._stack_field(batch, key, tgt_dtype)
 
-        if self.normalize_images:
+        # "images" is absent when the video modality is dropped (stage 1 never reads
+        # it -- see build_dataset drop_video), so normalize only when it is present.
+        if self.normalize_images and "images" in out:
             out["images"] = out["images"] / 255.0  # convert to float32
 
         out["embodiment_id"] = torch.as_tensor([b["embodiment_id"] for b in batch],
