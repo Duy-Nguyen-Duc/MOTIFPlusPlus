@@ -214,3 +214,13 @@ outputs*/
 paper_pic/
 demo_data/
 demo_data_processed/
+
+# archived experiment outputs (moved from outputs_*/ 2026-08-31)
+runs/
+
+# Object-augmented dataset copy (data/process/append_object_action_dims.py);
+# regenerable, videos are symlinks into demo_data_processed/
+demo_data_processed_obj/
+
+# internal server/infra notes - not for the public repo
+AI_AGENTS_SETUP.md

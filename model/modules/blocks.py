@@ -632,3 +632,214 @@ class VectorQuantizer(nn.Module):
         z = self.codebook(indices)
 
         return z, indices, distance
+
+
+class ResidualVectorQuantizer(nn.Module):
+    """Multi-level VQ: level 1 quantizes x, each later level quantizes the residual.
+
+    Why (measured 2026-09-03, EXPERIMENTS.md "The quantizer is the constraint").
+    A single 128-code level has to do two incompatible jobs at once, and the
+    ledger has the numbers for both:
+
+      * it MAKES TRANSFER WORK -- embodiment identity per token drops 0.654 in
+        the continuous key to 0.261 after quantization (the `grounded` gate),
+        0.937 -> 0.299 on ee-obj. Rounding to a shared vocabulary is what strips
+        robot identity.
+      * it DESTROYS SCENE PRECISION -- `grounded`'s visual FDM drove the
+        gripper->goal read to 2.51 cm in the key, the DINO ceiling, and
+        quantization returned it to 3.85 cm. ee-obj: 1.03 -> 9.25 cm.
+
+    Residual quantization separates the two. Level 1 stays the coarse shared
+    alphabet, and that is where the embodiment-blindness claim lives; the deeper
+    levels encode what level 1 rounds away, so the SUM can carry precision the
+    alphabet does not have to.
+
+    Standard construction (SoundStream / EnCodec). NOT "more codes": dyn already
+    took one level 128 -> 192 and moved nothing, villa-X uses 32 codes and UniVLA
+    16. More LEVELS, not a bigger level.
+
+    Interface is deliberately identical to VectorQuantizer so nothing downstream
+    changes: `forward` returns the same 5-tuple, `inference_forward` the same
+    3-tuple (both with z = the SUM over levels, and the LEVEL-1 indices and
+    distances, which is what the perplexity/usage logging and the code-restart
+    machinery consume). `cumulative_levels` is the extra hook the gate needs to
+    probe level 1 alone against all levels.
+
+    The commitment/codebook loss is computed outside, by
+    MOTIFStage1.compute_loss, from (z_e, z). With z = sum of levels that is the
+    correct joint objective: d/dz_l ||sum_l z_l - z_e||^2 is the same for every
+    level, so all codebooks are fitted to explain the input jointly while the
+    nearest-neighbour assignment stays greedy on residuals.
+    """
+
+    def __init__(self, num_latents: int, latent_dim: int, num_levels: int = 3,
+                 code_restart: bool = True) -> None:
+        super().__init__()
+        assert num_levels >= 1, num_levels
+        self.levels = nn.ModuleList([
+            VectorQuantizer(num_latents, latent_dim, code_restart=code_restart)
+            for _ in range(num_levels)
+        ])
+        self.num_latents = num_latents
+        self.num_levels = num_levels
+        self.code_restart = code_restart
+
+    @property
+    def codebook(self) -> nn.Embedding:
+        """Level 1's codebook -- the shared alphabet, and what callers asking for
+        `vq.codebook` (stage 2/3 reading the code width) mean."""
+        return self.levels[0].codebook
+
+    @property
+    def usage(self) -> Tensor:
+        """Level 1's usage counters.
+
+        MOTIFStage1.plot_and_reset_code_usage reads `vq.usage` directly at every
+        epoch boundary, so this is not optional -- omitting it crashed the first
+        rvq launch at the end of epoch 1 (2026-09-03 16:20). Level 1 is the right
+        answer for the same reason `codebook` returns level 1's: the usage plot
+        is about the shared alphabet. Per-level counters remain on
+        `self.levels[i].usage` for anyone who wants the deeper ones.
+        """
+        return self.levels[0].usage
+
+    def _sync_restart(self) -> None:
+        for lv in self.levels:
+            lv.code_restart = self.code_restart
+
+    def random_restart(self) -> None:
+        self._sync_restart()
+        if self.code_restart:
+            for lv in self.levels:
+                lv.random_restart()
+
+    def reset_usage(self) -> None:
+        self._sync_restart()
+        if self.code_restart:
+            for lv in self.levels:
+                lv.reset_usage()
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        residual = x
+        z_total, idx0, dist0 = 0.0, None, None
+        for i, lv in enumerate(self.levels):
+            distance = torch.cdist(residual, lv.codebook.weight)
+            indices = torch.argmin(distance, dim=-1)
+            z_l = lv.codebook(indices)
+            if not self.training or lv.code_restart:
+                lv.update_usage(indices)
+            z_total = z_total + z_l
+            # Detached so the greedy assignment of level i+1 does not backprop
+            # through level i's codebook; the gradient path is z_total.
+            residual = residual - z_l.detach()
+            if i == 0:
+                idx0, dist0 = indices, distance
+        z_q = x + (z_total - x).detach()
+        return z_q, z_total, x, idx0, dist0
+
+    @torch.no_grad()
+    def inference_forward(self, x: Tensor):
+        residual = x
+        z_total, idx0, dist0 = 0.0, None, None
+        for i, lv in enumerate(self.levels):
+            distance = torch.cdist(residual, lv.codebook.weight)
+            indices = torch.argmin(distance, dim=-1)
+            z_l = lv.codebook(indices)
+            z_total = z_total + z_l
+            residual = residual - z_l
+            if i == 0:
+                idx0, dist0 = indices, distance
+        return z_total, idx0, dist0
+
+    @torch.no_grad()
+    def cumulative_levels(self, x: Tensor):
+        """[z_1, z_1+z_2, ...] -- for the gate, which must report level 1 alone
+        (the alphabet: embodiment must stay near chance) separately from the full
+        sum (the geometry: ee->goal must move toward the DINO ceiling)."""
+        residual, running, out = x, 0.0, []
+        for lv in self.levels:
+            indices = torch.argmin(torch.cdist(residual, lv.codebook.weight), dim=-1)
+            z_l = lv.codebook(indices)
+            running = running + z_l
+            residual = residual - z_l
+            out.append(running.clone())
+        return out
+
+
+class PerSlotQuantizer(nn.Module):
+    """One independent codebook per kinematic slot, instead of one shared over all.
+
+    Motivation (user, 2026-09-04): translation (R^3, metres), orientation (SO(3)
+    via quaternions) and the gripper (1-D) are topologically distinct, and a
+    single shared vocabulary makes them compete for the same vectors and learn
+    entangled geometric compromises.
+
+    Measured caveat, on grounded's epoch_0020 over 30 720 tokens: the shared
+    codebook has already largely self-partitioned. 110 of 127 used codes (87%)
+    are touched by exactly ONE slot; translation/orientation/gripper use 52/45/51
+    codes each; only ~20% of each slot's token mass lands on a code another slot
+    also uses. So the competition this removes is mostly already absent, and the
+    dominant effect of per-slot codebooks at the same `codebook_size` is a ~2.5x
+    capacity increase per slot (128 each instead of ~50 of a shared 128), not a
+    topological fix. Run the capacity-matched variant (codebook_size ~= 128/3)
+    alongside to separate the two.
+
+    Interface matches VectorQuantizer so nothing downstream changes, with one
+    addition: `forward(x, slot=i)` selects a codebook explicitly (the stage-1
+    path already loops over slots), while `inference_forward(x)` on a full
+    [B, S*H, D] key dispatches by token position, which is what stage 2/3 need.
+    All slots share one `codebook_size`; indices are LOCAL to a slot, so the
+    usage/perplexity statistics aggregate across slots as before.
+    """
+
+    def __init__(self, num_latents: int, latent_dim: int, num_slots: int = 3,
+                 code_restart: bool = True) -> None:
+        super().__init__()
+        self.slots = nn.ModuleList([
+            VectorQuantizer(num_latents, latent_dim, code_restart=code_restart)
+            for _ in range(num_slots)
+        ])
+        self.num_latents = num_latents
+        self.num_slots = num_slots
+        self.code_restart = code_restart
+
+    @property
+    def codebook(self) -> nn.Embedding:
+        return self.slots[0].codebook
+
+    @property
+    def usage(self) -> Tensor:
+        """Summed over slots -- indices are slot-local, so this is the aggregate
+        histogram the epoch-boundary plot has always shown."""
+        return torch.stack([s.usage for s in self.slots], dim=0).sum(0)
+
+    def _sync(self) -> None:
+        for s in self.slots:
+            s.code_restart = self.code_restart
+
+    def random_restart(self) -> None:
+        self._sync()
+        if self.code_restart:
+            for s in self.slots:
+                s.random_restart()
+
+    def reset_usage(self) -> None:
+        self._sync()
+        if self.code_restart:
+            for s in self.slots:
+                s.reset_usage()
+
+    def forward(self, x: Tensor, slot: int = 0):
+        return self.slots[slot](x)
+
+    @torch.no_grad()
+    def inference_forward(self, x: Tensor):
+        """x: [B, S*H, D] -- split by token position, one codebook per slot."""
+        B, N, D = x.shape
+        assert N % self.num_slots == 0, (N, self.num_slots)
+        H = N // self.num_slots
+        zs, idxs, ds = [], [], []
+        for i, s in enumerate(self.slots):
+            z, idx, dist = s.inference_forward(x[:, i * H:(i + 1) * H])
+            zs.append(z); idxs.append(idx); ds.append(dist)
+        return torch.cat(zs, 1), torch.cat(idxs, 1), torch.cat(ds, 1)

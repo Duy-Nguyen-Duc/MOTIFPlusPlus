@@ -16,6 +16,7 @@ class InferenceWrapper:
                  model_path: Path,
                  denoising_steps: Optional[int] = None,
                  device: Union[int, str] = "cuda" if torch.cuda.is_available() else "cpu",
+                 latent_mode: Optional[str] = None,
                  ):
 
         cfg_path = Path(model_path).parent / "config.json"
@@ -31,6 +32,17 @@ class InferenceWrapper:
             if not (k.startswith("mkl.dino_encoder.") or k.startswith("mkl.text_encoder.")):
                 print("  ", k)
         print("[load stage3] unexpected keys:", unexpected)
+
+        # Eval-only override of what is threaded to the flow head as
+        # latent_action. Weights are untouched, so this ablates a channel of an
+        # already-trained checkpoint (e.g. code_residual -> code_zerores holds
+        # the residual half at zero) without retraining.
+        if latent_mode is not None:
+            prev = getattr(self.model, "latent_mode", None)
+            if prev is None:
+                raise ValueError("checkpoint's stage-3 model has no latent_mode")
+            self.model.latent_mode = latent_mode
+            print(f"[latent_mode override] {prev} -> {latent_mode}", flush=True)
 
         self.model.to(device)
         self.model.eval()

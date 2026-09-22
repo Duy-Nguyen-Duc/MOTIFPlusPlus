@@ -180,6 +180,10 @@ class ConcatTransform(InvertibleModalityTransform):
             # TODO: Extract rel_state and progress if exist
             rel_state_keys = [k for k in action_keys if k.startswith("action.rel_state")]
             progress_keys = [k for k in action_keys if k.startswith("action.progress")]
+            # Gripper->object offset, present only in the object-augmented dataset
+            # (see data/process/append_object_action_dims.py). Routed to its own
+            # field like rel_state so it never enters the action target.
+            obj_keys = [k for k in action_keys if k.startswith("action.ee_to_obj")]
             if rel_state_keys:
                 data["rel_state"] = torch.cat(
                     [data.pop(key) for key in rel_state_keys], dim=-1
@@ -188,10 +192,15 @@ class ConcatTransform(InvertibleModalityTransform):
                 data["progress"] = torch.cat(
                     [data.pop(key) for key in progress_keys], dim=-1
                 ).squeeze(-1)
+            if obj_keys:
+                data["ee_to_obj"] = torch.cat(
+                    [data.pop(key) for key in obj_keys], dim=-1
+                )
             # Concatenate the action keys
             # We'll have StateActionToTensor before this transform, so here we use torch.cat
             data["action"] = torch.cat(
-                [data.pop(key) for key in self.action_concat_order if key not in rel_state_keys + progress_keys], dim=-1
+                [data.pop(key) for key in self.action_concat_order
+                 if key not in rel_state_keys + progress_keys + obj_keys], dim=-1
             )  # [T, D_action]
 
         return data

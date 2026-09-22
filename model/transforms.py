@@ -346,6 +346,10 @@ class GR00TTransform(InvertibleModalityTransform):
             transformed_data["rel_state"] = data['rel_state']
         if "progress" in data:
             transformed_data["progress"] = data['progress']
+        # Gripper->object offset: present only with the object-augmented
+        # dataset, consumed by the stage-2 trace auxiliary.
+        if "ee_to_obj" in data:
+            transformed_data["ee_to_obj"] = data["ee_to_obj"]
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

@@ -19,6 +19,8 @@ class MOTIFCollator:
             "images": torch.float32 if normalize_images else torch.uint8,
             'rel_state': torch.float32,
             'progress': torch.float32,
+            # Only present with the object-augmented dataset; absent keys are skipped.
+            'ee_to_obj': torch.float32,
         }
 
     @staticmethod

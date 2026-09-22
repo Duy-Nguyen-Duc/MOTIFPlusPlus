@@ -65,6 +65,24 @@ def main(cfg: DictConfig):
     loader = build_loader(dataset, cfg.dataset, device)
 
     # Build model/optimizer/scheduler/loss
+    # ---- mixed precision -------------------------------------------------
+    _amp_mode = str(cfg.train.get("amp", "off")).lower()
+    if _amp_mode in ("bf16", "bfloat16"):
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("train.amp=bf16 but this GPU does not support bfloat16")
+        log.info("mixed precision: bf16 autocast ENABLED")
+        def _amp_ctx():
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        # TF32 for the fp32 ops that remain (optimizer, LayerNorm reductions).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    elif _amp_mode in ("off", "none", "fp32"):
+        from contextlib import nullcontext
+        def _amp_ctx():
+            return nullcontext()
+    else:
+        raise ValueError(f"train.amp must be bf16 or off, got {_amp_mode!r}")
+
     model = build_model(cfg.models.stage3).to(device)
     iters_per_epoch = (
         len(loader) if cfg.train.iters_per_epoch == 0 else cfg.train.iters_per_epoch
@@ -140,7 +158,19 @@ def main(cfg: DictConfig):
                 if isinstance(batch[k], torch.Tensor):
                     batch[k] = batch[k].to(device, non_blocking=True)
 
-            raw_loss = model(batch, causal_attn=False)
+            # Mixed precision, OPT-IN via train.amp (default "off" so every arm
+            # trained before 2026-09-05 reproduces bit-for-bit).
+            #
+            # Why: measured on the perslot stage-2 run, the A100 sat at ~55%
+            # "utilisation" with 2165 MiB of 81920 used (2.6%) and CPU load 8/32
+            # -- nothing was saturated. Everything ran fp32, so the tensor cores
+            # were idle; DINOv2 ViT-B is exactly the dense-matmul workload they
+            # exist for. bf16 needs no GradScaler (unlike fp16): its exponent
+            # range matches fp32, so there is nothing to underflow.
+            with _amp_ctx():
+                raw_loss = model(batch, causal_attn=False)
+            # Backward OUTSIDE autocast: gradients accumulate in fp32 master
+            # weights, which is what keeps bf16 training numerically equivalent.
             loss = raw_loss / max(1, cfg.train.grad_accum_steps)
             loss.backward()
 

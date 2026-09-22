@@ -1,0 +1,28 @@
+diff --git a/mani_skill/envs/utils/system/backend.py b/mani_skill/envs/utils/system/backend.py
+index 2d3444e..8a8cdb4 100644
+--- a/mani_skill/envs/utils/system/backend.py
++++ b/mani_skill/envs/utils/system/backend.py
+@@ -1,6 +1,7 @@
+ """
+ Utilities for determining the simulation backend and devices
+ """
++import os
+ import platform
+ from dataclasses import dataclass
+ 
+@@ -44,7 +45,14 @@ render_backend_name_mapping = {
+ 
+ def parse_sim_and_render_backend(sim_backend: str, render_backend: str) -> BackendInfo:
+     sim_backend = sim_backend_name_mapping[sim_backend]
+-    render_backend = render_backend_name_mapping[render_backend]
++    # Allow an environment-level override. Neither the motionplanning run.py scripts nor
++    # replay_trajectory.py expose render_backend as a CLI flag, so this is the only place
++    # a non-default renderer (e.g. a software Vulkan device "pci:0") can be selected
++    # without editing each entry point.
++    render_backend = os.environ.get("MS_RENDER_BACKEND", render_backend)
++    # Pass unknown names through so explicit device specs such as "pci:0" reach the
++    # sapien.Device(...) fallback below, which the else-branch already documents.
++    render_backend = render_backend_name_mapping.get(render_backend, render_backend)
+     if sim_backend == "physx_cpu":
+         device = torch.device("cpu")
+         sim_device = sapien.Device("cpu")

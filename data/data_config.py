@@ -358,6 +358,62 @@ class PiperEndposeDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 ###########################################################################################
 
+class PANDAWithRELObjDataConfig(PANDAWithRELDataConfig):
+    """RELData plus the gripper->object offset (action.ee_to_obj).
+
+    Opt-in: only embodiments registered as *_rel_obj load the extra dims, and
+    they exist only in the object-augmented dataset built by
+    data/process/append_object_action_dims.py. Every other arm is unaffected.
+    """
+    action_keys = PANDAWithRELDataConfig.action_keys + ["action.ee_to_obj"]
+
+
+class PANDAWithRELPairDataConfig(PANDAWithRELDataConfig):
+    """Two observation timesteps instead of one, for the DINO-target stage 1.
+
+    That stage defines a motif as the change between O_t and O_{t+k}, so the
+    batch has to carry both frames; every other config in this file returns
+    `observation_indices = [0]` and images shaped [B, v, t=1, ...].
+
+    Only the VIDEO modality takes the pair. State and language stay at [0]:
+    stage 1 reads neither at t=1, `batch["language"]` is consumed as one string
+    per sample by the InfoNCE term and the conditional discriminator, and a
+    second index would silently turn both into length-2 sequences.
+
+    PAIR_DELTA is in dataset steps. Demos were recorded at 20 Hz, so 20 steps is
+    the ~1 second UniVLA calibrates its latent actions to. Near the end of an
+    episode the loader clamps, which makes the target the final frame -- i.e. a
+    smaller observed change, which is correct.
+    """
+    PAIR_DELTA = 20
+    observation_indices = [0]      # state / language / GR00TTransform horizon
+
+    def modality_config(self) -> dict:
+        cfg = super().modality_config()
+        cfg["video"] = ModalityConfig(
+            delta_indices=[0, self.PAIR_DELTA],
+            modality_keys=self.video_keys,
+        )
+        return cfg
+
+
+class PANDAWithRELPairBaseDataConfig(PANDAWithRELPairDataConfig):
+    """Frame pair, BASE CAMERA ONLY -- for the grounded stage 1.
+
+    That stage's visual FDM reads `images[:, view_index, 0]` and `[:, view_index, 1]`
+    with view_index=0, and nothing else in stage 1 touches images at all. With
+    both views the wrist camera is read from the frame cache, cropped, resized,
+    colour-jittered, collated and copied to the GPU on every sample, and then
+    never indexed.
+
+    Dropping it halves the image bytes per sample (2.4 -> 1.2 MB), which halves
+    the /dev/shm footprint, the pfss read volume and the augmentation CPU. It
+    changes nothing the model sees. Stage 2 keeps both views -- its perceiver
+    consumes them -- via dataset_maniskill_contact_s2.yaml.
+    """
+    video_keys = ["video.image"]
+
+
 DATA_CONFIG_MAP = {
     'xarm6': PANDADataConfig(),
     'panda': PANDADataConfig(),
@@ -367,6 +423,15 @@ DATA_CONFIG_MAP = {
     'panda_rel': PANDAWithRELDataConfig(),
     'xarm7_rel': PANDAWithRELDataConfig(),
     'widowxai_rel': PANDAWithRELDataConfig(),
+    'panda_rel_obj': PANDAWithRELObjDataConfig(),
+    'xarm6_rel_obj': PANDAWithRELObjDataConfig(),
+    'widowxai_rel_obj': PANDAWithRELObjDataConfig(),
+    'panda_rel_pair': PANDAWithRELPairDataConfig(),
+    'xarm6_rel_pair': PANDAWithRELPairDataConfig(),
+    'widowxai_rel_pair': PANDAWithRELPairDataConfig(),
+    'panda_rel_pair_base': PANDAWithRELPairBaseDataConfig(),
+    'xarm6_rel_pair_base': PANDAWithRELPairBaseDataConfig(),
+    'widowxai_rel_pair_base': PANDAWithRELPairBaseDataConfig(),
     'piper_joint': PiperJointDataConfig(),
     'piper_endpose': PiperEndposeDataConfig(),
 

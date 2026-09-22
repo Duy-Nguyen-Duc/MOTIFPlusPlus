@@ -626,7 +626,12 @@ class LeRobotSingleDataset(Dataset):
                 episode_chunk=chunk_index, episode_index=trajectory_id
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            return pd.read_parquet(parquet_path)
+            # Publish the cache key only after a successful read. Updating both
+            # fields here also covers direct callers outside get_step_data.
+            trajectory_data = pd.read_parquet(parquet_path)
+            self.curr_traj_data = trajectory_data
+            self.curr_traj_id = trajectory_id
+            return trajectory_data
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
         """Get the index of the trajectory in the dataset by the trajectory ID.

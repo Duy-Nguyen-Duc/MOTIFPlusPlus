@@ -2,6 +2,7 @@ import os
 from typing import Dict
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -264,6 +265,7 @@ class ActionMotifLearning(nn.Module):
         downsample_factor: int = 1,   
         depth_enc_low: int = 0,      
         depth_dec_low: int = 0,      
+        add_embodiment_token: bool = False,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -305,6 +307,14 @@ class ActionMotifLearning(nn.Module):
             downsample_factor=self.downsample_factor,
         )
 
+        # Decoder-side channel for embodiment-constant style: with it, the codes
+        # need not carry embodiment detail to reconstruct, so the adversarial
+        # head stops fighting the reconstruction loss. Indexed by the global
+        # embodiment id (EMBODIMENT_TAG_MAPPING). Decoder-side only.
+        self.add_embodiment_token = add_embodiment_token
+        if add_embodiment_token:
+            self.embodiment_token = nn.Embedding(16, latent_dim)
+
     def forward(self, batch: Dict[str, torch.Tensor], causal_attn: bool = False):
         """
         batch: dict(progress=[B,H], rel_state=[B,H,state_dim])
@@ -315,7 +325,11 @@ class ActionMotifLearning(nn.Module):
         # VQ
         z_q, z, x_vq_in, indices, distance = self.vq(z_e)
         # decoder
-        state_seq_hat = self.decoder(z_q, progress, causal=causal_attn)  # [B, H, state_dim]
+        dec_in = z_q
+        if self.add_embodiment_token:
+            tok = self.embodiment_token(batch["embodiment_id"].long().view(-1))
+            dec_in = z_q + tok.unsqueeze(1)
+        state_seq_hat = self.decoder(dec_in, progress, causal=causal_attn)  # [B, H, state_dim]
         return dict(recon=state_seq_hat, z_e=z_e, z_q=z_q, idx=indices, z=z)
 
     def compute_loss(
@@ -556,7 +570,14 @@ def plot_usage_distribution(usage, saved_path):
     for n in range(1, 10):
         if (2 ** n) ** 2 <= len(data) < (2 ** (n + 1)) ** 2:
             break
-    data = data.reshape(2 ** n, -1)
+    # A codebook whose size is not a multiple of 2**n cannot be reshaped to a
+    # rectangle (K=43 per slot raised "cannot reshape array of size 43 into
+    # shape (4,newaxis)"). Pad with zeros to the next multiple -- this is a
+    # diagnostic image, and padded cells simply read as unused.
+    rows = 2 ** n
+    if len(data) % rows:
+        data = np.concatenate([data, np.zeros(rows - len(data) % rows, dtype=data.dtype)])
+    data = data.reshape(rows, -1)
     fig, ax = plt.subplots()
     cax = ax.matshow(data, interpolation="nearest")
     fig.colorbar(cax)

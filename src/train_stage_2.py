@@ -1,4 +1,5 @@
 import os
+import glob
 import time
 import json
 import logging
@@ -63,6 +64,27 @@ def main(cfg: DictConfig):
     loader = build_loader(dataset, cfg.dataset, device)
 
     # Build model/optimizer/scheduler/loss
+    # ---- mixed precision (opt-in, default off) ---------------------------
+    # Measured 2026-09-05 on the perslot stage-2 run: A100 at ~55% utilisation,
+    # 2165 MiB of 81920 used (2.6%), CPU load 8/32 -- nothing saturated, because
+    # everything ran fp32 (tensor cores idle) with batch 8 accumulated 16x.
+    # bf16 needs no GradScaler: its exponent range matches fp32.
+    _amp_mode = str(cfg.train.get("amp", "off")).lower()
+    if _amp_mode in ("bf16", "bfloat16"):
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("train.amp=bf16 but this GPU does not support bfloat16")
+        log.info("mixed precision: bf16 autocast ENABLED")
+        def _amp_ctx():
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    elif _amp_mode in ("off", "none", "fp32"):
+        from contextlib import nullcontext
+        def _amp_ctx():
+            return nullcontext()
+    else:
+        raise ValueError(f"train.amp must be bf16 or off, got {_amp_mode!r}")
+
     model = build_model(cfg.models.stage2).to(device)
     iters_per_epoch = (
         len(loader) if cfg.train.iters_per_epoch == 0 else cfg.train.iters_per_epoch
@@ -85,9 +107,43 @@ def main(cfg: DictConfig):
         )
 
     global_iters = 0
+    start_epoch = 1
+
+    # Resume support: checkpoints carry optimizer/scheduler/RNG so a resumed run
+    # continues the same schedule and data stream. Stage 2 has no last.pth --
+    # only the interval checkpoints exist, so "auto" picks the newest of those.
+    resume_from = cfg.train.get("resume_from", None)
+    if resume_from == "auto":
+        existing = sorted(glob.glob(os.path.join(out_dir, "epoch_*.pth")))
+        resume_from = existing[-1] if existing else None
+    if resume_from:
+        log.info(f"=> resuming from {resume_from}")
+        ck = torch.load(resume_from, map_location="cpu")
+        # strict=False: checkpoints hold only stage-2 weights; the frozen
+        # vq_vae/dino/text encoders were rebuilt from their own ckpts above.
+        model.load_state_dict(ck["model"], strict=False)
+        if "optimizer" not in ck:
+            # Refuse to "resume" without optimizer state: that would restart the
+            # LR schedule at epoch 1 with warm weights.
+            raise RuntimeError(
+                f"{resume_from} has no optimizer state. Resuming from it would "
+                "restart the LR schedule at epoch 1 with pre-trained weights, "
+                "which is not a continuation. Delete it or train from scratch "
+                "into a fresh output_dir."
+            )
+        optim.load_state_dict(ck["optimizer"])
+        sched.load_state_dict(ck["scheduler"])
+        global_iters = ck.get("global_iters", 0)
+        start_epoch = ck["epoch"] + 1
+        restored = load_rng_state(ck.get("rng"))
+        log.info(f"=> resumed at epoch {start_epoch}, rng_restored={restored}")
+        if not restored:
+            log.warning("=> no RNG state in checkpoint: the shuffle and augmentation "
+                        "stream restarts, so this run is NOT equivalent to an "
+                        "uninterrupted one")
 
     # train loop
-    for epoch in range(1, cfg.train.epochs + 1):
+    for epoch in range(start_epoch, cfg.train.epochs + 1):
         model.train()
         total_loss, n_seen, iters = 0.0, 0, 0
         optim.zero_grad(set_to_none=True)
@@ -100,7 +156,8 @@ def main(cfg: DictConfig):
                 if isinstance(batch[k], torch.Tensor):
                     batch[k] = batch[k].to(device, non_blocking=True)
 
-            raw_loss = model(batch, causal_attn=False)
+            with _amp_ctx():
+                raw_loss = model(batch, causal_attn=False)
 
             # Gradient accumulation
             loss = raw_loss / max(1, cfg.train.grad_accum_steps)

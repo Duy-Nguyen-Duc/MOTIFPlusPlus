@@ -1,0 +1,235 @@
+{
+  "dataset": {
+    "dataset_path": [
+      "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/cross_emb_2/NewTest/MOTIF/demo_data_processed/panda",
+      "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/cross_emb_2/NewTest/MOTIF/demo_data_processed/xarm6",
+      "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/cross_emb_2/NewTest/MOTIF/demo_data_processed/widowxai"
+    ],
+    "embodiment_tag": [
+      "panda_rel",
+      "xarm6_rel",
+      "widowxai_rel"
+    ],
+    "data_config": [
+      "panda_rel",
+      "xarm6_rel",
+      "widowxai_rel"
+    ],
+    "video_backend": [
+      "decord",
+      "decord",
+      "decord"
+    ],
+    "modifiy_tasks_num": [
+      {
+        "Push the cube across the surface to the target location.": 5,
+        "Pick up the sphere and place it precisely into the target.": 5
+      },
+      {
+        "Pull the cube toward the target marker.": 5,
+        "Lift the peg and stand it upright.": 5
+      },
+      {
+        "Pick up the cube.": 5,
+        "Stack the cube on top of the other cube.": 5
+      }
+    ],
+    "drop_video": true,
+    "frame_cache_root": "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/cross_emb_2/NewTest/MOTIF/demo_data/frame_cache",
+    "window_size": 32,
+    "sampling_weights": null,
+    "batch_size": 8,
+    "num_workers": 16,
+    "prefetch_factor": 1,
+    "pin_memory": false,
+    "drop_last": true,
+    "persistent_workers": false,
+    "shuffle": true,
+    "balance_tasks": true,
+    "collator": {
+      "normalize_images": true
+    }
+  },
+  "models": {
+    "stage1": {
+      "class_name": "MOTIFStage1Factorized",
+      "state_dim": 8,
+      "model_dim": 256,
+      "latent_dim": 256,
+      "codebook_size": 128,
+      "window_size": 32,
+      "depth_enc": 4,
+      "depth_dec": 4,
+      "depth_enc_low": 0,
+      "depth_dec_low": 0,
+      "downsample_factor": 2,
+      "num_heads": 8,
+      "dropout": 0.1,
+      "local_w": 16,
+      "use_sinusoidal_pe": false,
+      "vq_beta": 0.25,
+      "cross_slot": true,
+      "slots": [
+        [
+          "translation",
+          0,
+          3
+        ],
+        [
+          "orientation",
+          3,
+          7
+        ],
+        [
+          "gripper",
+          7,
+          8
+        ]
+      ]
+    },
+    "stage2": {
+      "class_name": "MOTIFStage2",
+      "vq_vae_ckpt": null,
+      "model_dim": 512,
+      "perceiver_depth": 6,
+      "perceiver_heads": 8,
+      "perceiver_dim_head": 64,
+      "perceiver_max_tokens": 1000
+    },
+    "stage3": {
+      "class_name": "MOTIFStage3",
+      "mkl_cfg": {
+        "class_name": "MOTIFStage2",
+        "vq_vae_ckpt": null,
+        "model_dim": 512,
+        "perceiver_depth": 6,
+        "perceiver_heads": 8,
+        "perceiver_dim_head": 64,
+        "perceiver_max_tokens": 1000
+      },
+      "mkl_ckpt": null,
+      "add_latent_action": false,
+      "flow_matching_cfg": {
+        "action_horizon": 16,
+        "add_pos_embed": true,
+        "backbone_embedding_dim": 512,
+        "add_latent_action": false,
+        "latent_action_dim": 256,
+        "diffusion_model_cfg": {
+          "attention_head_dim": 64,
+          "cross_attention_dim": 512,
+          "dropout": 0.2,
+          "final_dropout": true,
+          "interleave_self_attention": true,
+          "norm_type": "ada_norm",
+          "num_attention_heads": 8,
+          "num_layers": 16,
+          "output_dim": 512,
+          "positional_embeddings": null
+        },
+        "max_num_embodiments": 10,
+        "hidden_size": 512,
+        "input_embedding_dim": 512,
+        "max_action_dim": 10,
+        "max_state_dim": 10,
+        "noise_beta_alpha": 1.5,
+        "noise_beta_beta": 1,
+        "noise_s": 0.999,
+        "num_inference_timesteps": 4,
+        "num_timestep_buckets": 1000,
+        "tune_diffusion_model": true,
+        "tune_projector": true,
+        "use_vlln": true,
+        "vl_self_attention_cfg": {
+          "attention_head_dim": 64,
+          "dropout": 0.2,
+          "final_dropout": true,
+          "num_attention_heads": 8,
+          "num_layers": 4,
+          "positional_embeddings": null
+        }
+      }
+    }
+  },
+  "optim": {
+    "stage1": {
+      "lr": 0.0001,
+      "weight_decay": 0.01,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-8,
+      "min_lr": 1e-8,
+      "T_max_factor": 1,
+      "warmup_ratio": 0.05,
+      "warmup_lr": 1e-9
+    },
+    "stage2": {
+      "lr": 0.0001,
+      "weight_decay": 0.01,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-8,
+      "min_lr": 1e-8,
+      "T_max_factor": 1,
+      "warmup_ratio": 0.05,
+      "warmup_lr": 1e-9
+    },
+    "stage3": {
+      "lr": 0.0001,
+      "weight_decay": 0.01,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-8,
+      "min_lr": 1e-8,
+      "T_max_factor": 1,
+      "warmup_ratio": 0.05,
+      "warmup_lr": 1e-9
+    }
+  },
+  "seed": 43,
+  "device": "cuda:0",
+  "output_dir": "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/cross_emb_2/NewTest/MOTIF/runs/f1_seed43_full/outputs_stage1",
+  "window_size": 32,
+  "local_w": 16,
+  "batch_size": 8,
+  "add_info_NCE": true,
+  "lambda_infonce": 0.1,
+  "add_latent_action": false,
+  "use_adversarial": true,
+  "num_robots": 3,
+  "num_progress_bins": 4,
+  "lambda_adv": 0.1,
+  "tasks_num": 6,
+  "balance_tasks": true,
+  "train": {
+    "epochs": 20,
+    "grad_accum_steps": 16,
+    "grad_clip_norm": 1,
+    "iters_per_epoch": 0,
+    "log_interval": 10,
+    "ckpt_interval": 10,
+    "resume_from": null
+  },
+  "wandb": {
+    "enable": false,
+    "project": "MOTIF-stage1",
+    "name": "2026-08-26/14-31-11",
+    "tags": [
+      "stage1"
+    ],
+    "notes": null,
+    "offline": false,
+    "log_code": false,
+    "watch": false,
+    "watch_log": "gradients",
+    "watch_freq": 10,
+    "log_ckpt": false
+  },
+  "K": 5,
+  "hydra": {
+    "run": {
+      "dir": "${output_dir}"
+    },
+    "output_subdir": null
+  }
+}

@@ -93,6 +93,9 @@ class FlowmatchingActionHeadConfig:
 
     add_latent_action: bool = False
     latent_action_dim: int = 256
+    motif_position_mode: str = "none"
+    motif_num_slots: Optional[int] = None
+    motif_tokens_per_slot: Optional[int] = None
 
     hidden_size: int = 1024
     max_seq_len: int = 1024
@@ -205,6 +208,23 @@ class FlowmatchingActionHead(nn.Module):
         self.config = config
         self.apply(self._init_weights)
 
+        # Opt-in identity after projection, where quantization cannot discard it.
+        # Allocate zero parameters after existing initialization: old weights and
+        # the RNG stream match the control exactly at initialization.
+        if config.motif_position_mode not in ("none", "slot_time"):
+            raise ValueError(f"Unknown motif_position_mode: {config.motif_position_mode}")
+        if config.motif_position_mode == "slot_time":
+            if not config.add_latent_action:
+                raise ValueError("slot_time requires add_latent_action=True")
+            if not config.motif_num_slots or not config.motif_tokens_per_slot:
+                raise ValueError("slot_time requires positive motif slot/time counts")
+            if config.motif_num_slots < 1 or config.motif_tokens_per_slot < 1:
+                raise ValueError("motif slot/time counts must be positive")
+            self.motif_slot_embedding = nn.Parameter(
+                torch.zeros(config.motif_num_slots, self.hidden_size))
+            self.motif_time_embedding = nn.Parameter(
+                torch.zeros(config.motif_tokens_per_slot, self.hidden_size))
+
         print(
             "Total number of Action Head parameters: ",
             sum(p.numel() for p in self.parameters() if p.requires_grad),
@@ -222,6 +242,28 @@ class FlowmatchingActionHead(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
             module.reset_parameters()        
+
+    def encode_latent_action(self, latent_action: torch.Tensor) -> torch.Tensor:
+        latent = self.latent_action_encoder(latent_action)
+        if self.config.motif_position_mode == "slot_time":
+            slots = self.config.motif_num_slots
+            times = self.config.motif_tokens_per_slot
+            if latent.ndim != 3 or latent.shape[1] != slots * times:
+                raise ValueError(f"Expected {slots} x {times} slot-major motif tokens; "
+                                 f"got {tuple(latent.shape)}")
+            identity = (self.motif_slot_embedding[:, None, :]
+                        + self.motif_time_embedding[None, :, :]).reshape(slots * times, -1)
+            latent = latent + identity.to(dtype=latent.dtype).unsqueeze(0)
+        return latent
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        if self.config.motif_position_mode == "slot_time":
+            for name in ("motif_slot_embedding", "motif_time_embedding"):
+                if prefix + name not in state_dict:
+                    error_msgs.append(f"Required motif identity weight missing: {prefix}{name}")
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
                 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -236,6 +278,9 @@ class FlowmatchingActionHead(nn.Module):
                 self.position_embedding.requires_grad_(False)
             if self.add_latent_action:
                 self.latent_action_encoder.requires_grad_(False)
+                if self.config.motif_position_mode == "slot_time":
+                    self.motif_slot_embedding.requires_grad_(False)
+                    self.motif_time_embedding.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         print(f"Tune action head projector: {self.tune_projector}")
@@ -340,7 +385,7 @@ class FlowmatchingActionHead(nn.Module):
 
         # Join vision, language, state and action embedding along sequence dimension.
         if self.add_latent_action:
-            latent_action_emb = self.latent_action_encoder(action_input.latent_action)
+            latent_action_emb = self.encode_latent_action(action_input.latent_action)
             sa_embs = torch.cat((state_features, latent_action_emb, action_features), dim=1)
         else:
             sa_embs = torch.cat((state_features, action_features), dim=1)
@@ -390,6 +435,15 @@ class FlowmatchingActionHead(nn.Module):
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
+        # These conditioning features do not depend on the denoising timestep.
+        latent_action_emb = (
+            self.encode_latent_action(action_input.latent_action)
+            if self.add_latent_action else None
+        )
+        if self.config.add_pos_embed:
+            pos_ids = torch.arange(self.action_horizon, dtype=torch.long, device=device)
+            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+
         # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
@@ -402,15 +456,12 @@ class FlowmatchingActionHead(nn.Module):
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
             # Maybe add position embedding.
             if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
             vl_embs = vl_embeds
 
             # Join vision, language, state and action embedding along sequence dimension.
             if self.add_latent_action:
-                latent_action_emb = self.latent_action_encoder(action_input.latent_action)
                 sa_embs = torch.cat((state_features, latent_action_emb, action_features), dim=1)
             else:
                 sa_embs = torch.cat((state_features, action_features), dim=1)
@@ -419,6 +470,7 @@ class FlowmatchingActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
+                encoder_attention_mask=None if self.use_vlln else backbone_output.backbone_attention_mask,
                 timestep=timesteps_tensor,
             )
             pred = self.action_decoder(model_output, embodiment_id)
