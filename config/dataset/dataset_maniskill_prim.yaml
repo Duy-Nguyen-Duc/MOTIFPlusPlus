@@ -1,0 +1,49 @@
+# ManiSkill interleaved-task split (MOTIF Table 2) with per-frame primitive labels (demo_data_processed_prim,
+# built by data/process/label_primitives.py). Every robot has two K-shot target tasks and four 50-demo source tasks:
+#            PushCube  PlaceSphere  PullCube  LiftPegUpright  PickCube  StackCube
+#   Panda       K          K          50           50           50        50
+#   xArm6      50         50           K            K           50        50
+#   WidowXAI   50         50          50           50            K         K
+# data_config_suffix: "" for stages 1-2, "_geo" for stage 3 (adds the raw tcp pose used by the geometry tokens).
+data_config_suffix: ""
+dataset_path:
+  - ./demo_data_processed_prim/panda
+  - ./demo_data_processed_prim/xarm6
+  - ./demo_data_processed_prim/widowxai
+embodiment_tag:
+  - panda_rel
+  - xarm6_rel
+  - widowxai_rel
+data_config:
+  - panda_rel_prim${dataset.data_config_suffix}
+  - xarm6_rel_prim${dataset.data_config_suffix}
+  - widowxai_rel_prim${dataset.data_config_suffix}
+video_backend:
+  - decord
+  - decord
+  - decord
+
+# K-shot target pairs; unlisted tasks keep all 50 demos (leading slice [:K], demos selected sequentially).
+modifiy_tasks_num:
+  - "Push the cube across the surface to the target location.": ${K}
+    "Pick up the sphere and place it precisely into the target.": ${K}
+  - "Pull the cube toward the target marker.": ${K}
+    "Lift the peg and stand it upright.": ${K}
+  - "Pick up the cube.": ${K}
+    "Stack the cube on top of the other cube.": ${K}
+
+drop_video: false                               # stage 1 sets true (no images needed)
+frame_cache_root: ./demo_data/frame_cache_full  # pre-decoded frames (data/process/prextract_frames.py --format webp)
+
+window_size: ${window_size}
+sampling_weights: null
+batch_size: ${batch_size}
+num_workers: 16
+prefetch_factor: 1
+pin_memory: false
+drop_last: true
+persistent_workers: false
+shuffle: true
+balance_tasks: ${balance_tasks}
+collator:
+  normalize_images: true

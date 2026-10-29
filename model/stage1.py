@@ -466,11 +466,18 @@ def compute_cross_robot_infonce(
     sigma: float = 0.02,
     hard_delta: float = None,
     eps: float = 1e-8,
+    min_weight: float = 0.0,
 ):
     """
     Multi-positive InfoNCE:
       positives: same language & close progress (soft weight or hard window)
       negatives: all others in batch
+      min_weight: soft weights below this are zeroed. With the legacy
+        sigma=0.02 on episode progress, far positives underflow to exactly 0 in
+        float32 and the anchor drops out when it has no near positive; with a
+        wider kernel (primitive progress, sigma=0.1) they stay subnormal and
+        such anchors return losses of ~100. The cutoff restores the legacy
+        behaviour: default 0 keeps the legacy numerics bit-identical.
 
     Returns:
       loss (scalar), stats dict
@@ -513,6 +520,8 @@ def compute_cross_robot_infonce(
     else:
         # soft gaussian weight
         W = lang_eq.float() * torch.exp(-(dp / sigma) ** 2)
+        if min_weight > 0:
+            W = W * (W >= min_weight).float()
 
     # ensure no self-positive
     W = W.masked_fill(eye, 0.0)

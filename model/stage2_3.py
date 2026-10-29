@@ -74,6 +74,13 @@ class MultimodalMotifPredictor(nn.Module):
                 from model.stage1_dino import DinoLatentActionLearning
                 self.vq_vae = DinoLatentActionLearning(**cfg)
                 num_slots = 1
+            elif stage1_cls_name == "MOTIFStage1Graph":
+                # Graph-guided routing: one token stream; keys are the routing
+                # queries q_m from forward(batch) (forward_for_keys), and the
+                # codebook is addressed by attention (RoutingCodebook).
+                from model.stage1_graph import GraphRoutedMotifLearning
+                self.vq_vae = GraphRoutedMotifLearning(**cfg)
+                num_slots = 1
             elif stage1_cls_name in ("MOTIFStage1Factorized", "MOTIFStage1Grounded"):
                 from model.stage1_factorized import FactorizedActionMotifLearning
                 if stage1_cls_name == "MOTIFStage1Grounded":
@@ -335,7 +342,7 @@ class MultimodalMotifPredictor(nn.Module):
 
         # The factorized stage 1 has per-slot encoders (no single .encoder); its
         # forward concatenates slot streams along the token axis.
-        if hasattr(self.vq_vae, "encoder"):
+        if hasattr(self.vq_vae, "encoder") and not getattr(self.vq_vae, "forward_for_keys", False):
             z_e = self.vq_vae.encoder(batch["rel_state"], batch["progress"], causal=causal_attn)
         else:
             z_e = self.vq_vae(batch, causal_attn=causal_attn)["z_e"]
@@ -410,6 +417,7 @@ class MotifRoboticPolicy(nn.Module):
         state_noise_std: float = 0.0,
         key_noise_std: float = 0.0,
         latent_mode: str = "code",
+        geometry_cfg: dict = None,
     ) -> None:
         super().__init__()
 
@@ -517,6 +525,16 @@ class MotifRoboticPolicy(nn.Module):
         t5_dim = 768
         self.lang_proj = nn.Linear(t5_dim, flow_matching_cfg['hidden_size'])
 
+        # Metric 3D positional encodings on the wrist-camera tokens (model/geometry_tokens.py);
+        # needs batch["tcp_pose"] from a *_geo data config. Zero-initialised: inert at start.
+        self.geometry = None
+        if geometry_cfg and geometry_cfg.get("enabled", True):
+            from model.geometry_tokens import GeometryTokens
+            gcfg = {k: v for k, v in dict(geometry_cfg).items() if k != "enabled"}
+            if "robots" in gcfg:
+                gcfg["robots"] = dict(gcfg["robots"])
+            self.geometry = GeometryTokens(hidden_size=flow_matching_cfg['hidden_size'], **gcfg)
+
     def get_observation_embedding(self, batch: Dict[str, torch.Tensor], encoded=None):
         if encoded is None:
             encoded = self.mkl.encode_raw(batch)
@@ -524,6 +542,8 @@ class MotifRoboticPolicy(nn.Module):
 
         lang_emb = self.lang_proj(lang_emb)
         img_emb = self.vision_proj(img_emb)
+        if self.geometry is not None:
+            img_emb = self.geometry(img_emb, batch)
 
         obs_seq = torch.cat([lang_emb, img_emb], dim=1)
         masks = torch.cat([lang_mask, img_mask], dim=1)
@@ -578,16 +598,21 @@ class MotifRoboticPolicy(nn.Module):
                 "backbone_attention_mask": ~masks.bool()    # mask is True for padding tokens
                 }
         )
-        action_head_input2 = BatchFeature(
-            data={
-                "embodiment_id": batch['embodiment_id'],
-                "state": state,
-                "action": batch['action'],
-                "action_mask": batch['action_mask'],
-                "latent_action": latent_action,
-                }
-        )
+        head_inputs = {
+            "embodiment_id": batch['embodiment_id'],
+            "state": state,
+            "action": batch['action'],
+            "action_mask": batch['action_mask'],
+            "latent_action": latent_action,
+        }
+        if "ee_to_obj" in batch:
+            # Gripper->object offset [B, T, 3] (object-augmented datasets only);
+            # consumed by the head's auxiliary loss when aux_obj_weight > 0.
+            head_inputs["ee_to_obj"] = batch["ee_to_obj"]
+        action_head_input2 = BatchFeature(data=head_inputs)
         action_head_outputs = self.flow_matching_head(action_head_input1, action_head_input2)
+        # Auxiliary terms for the trainer's log line (empty unless the head emits them).
+        self.last_aux = {k: v for k, v in action_head_outputs.items() if k.startswith("aux_")}
         return action_head_outputs.loss
 
     @torch.no_grad()
@@ -625,6 +650,18 @@ MODEL_REGISTRY = {
 
 def build_model(model_cfg: dict):
     name = model_cfg.get("class_name")
+    if name == "MOTIFStage3ELoRA" and name not in MODEL_REGISTRY:
+        from model.stage3_elora import MotifRoboticPolicyELoRA   # lazy: it imports this module
+        MODEL_REGISTRY[name] = MotifRoboticPolicyELoRA
+    if name == "MOTIFStage3VLA" and name not in MODEL_REGISTRY:
+        from model.vla_elora import VLAELoRAPolicy
+        MODEL_REGISTRY[name] = VLAELoRAPolicy
+    if name == "MOTIFStage3PI05" and name not in MODEL_REGISTRY:
+        from model.pi05_elora import PI05ELoRAPolicy   # frozen pi0.5 + E-LoRA + prompts
+        MODEL_REGISTRY[name] = PI05ELoRAPolicy
+    if name == "MOTIFStage3GR00T" and name not in MODEL_REGISTRY:
+        from model.gr00t_elora import GR00TELoRAPolicy   # frozen GR00T N1.5 + E-LoRA + prompts
+        MODEL_REGISTRY[name] = GR00TELoRAPolicy
     if name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model class_name: {name}")
     kwargs = {k: v for k, v in model_cfg.items() if k != "class_name"}

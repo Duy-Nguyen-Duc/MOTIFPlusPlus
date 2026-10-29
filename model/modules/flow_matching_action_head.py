@@ -117,6 +117,17 @@ class FlowmatchingActionHeadConfig:
     expand_batch: Optional[int] = None
     use_vlln: bool = True
 
+    # Auxiliary gripper->object regression from the DiT's own hidden states
+    # (fix 2 of eval_results/analysis/graph_rollout_diagnosis.md: the policy
+    # mislocalises the object and stops short of it). When aux_obj_weight > 0 a
+    # small head on the mean DiT output token regresses the current-frame
+    # offset action_input.ee_to_obj[:, 0] (metres, scaled by aux_obj_scale so
+    # 1 cm = 0.1 at the default 10). Weight 0 (default) allocates nothing, so
+    # every earlier checkpoint loads and trains unchanged. get_action ignores it.
+    aux_obj_weight: float = 0.0
+    aux_obj_scale: float = 10.0
+    aux_obj_clip: float = 0.5   # metres; the widowxai side-car has a 1.5 m glitch episode
+
     vl_self_attention_cfg: Dict[str, Any] = field(
         default_factory=dict,
         metadata={"help": "Config for VL self-attention transformer."},
@@ -194,6 +205,15 @@ class FlowmatchingActionHead(nn.Module):
                 nn.Linear(512, self.hidden_size),
             )
         self.add_latent_action = config.add_latent_action
+
+        self.aux_obj_weight = config.aux_obj_weight
+        self.aux_obj_scale = config.aux_obj_scale
+        if self.aux_obj_weight > 0:
+            self.obj_head = nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, 3),
+            )
 
         self.use_vlln = config.use_vlln
         if self.use_vlln:
@@ -408,6 +428,17 @@ class FlowmatchingActionHead(nn.Module):
         output_dict = {
             "loss": loss,
         }
+        ee_to_obj = action_input.get("ee_to_obj", None) if self.aux_obj_weight > 0 else None
+        if ee_to_obj is not None:
+            # Current-frame offset: the window starts at the observation frame.
+            target = ee_to_obj[:, 0] if ee_to_obj.dim() == 3 else ee_to_obj
+            target = target.clamp(-self.config.aux_obj_clip, self.config.aux_obj_clip)
+            pred_obj = self.obj_head(model_output.mean(dim=1))
+            aux = F.mse_loss(pred_obj, (target * self.aux_obj_scale).to(pred_obj.dtype))
+            loss = loss + self.aux_obj_weight * aux
+            output_dict["loss"] = loss
+            output_dict["aux_obj_loss"] = aux.detach()
+            output_dict["aux_obj_rmse_cm"] = (aux.detach().sqrt() / self.aux_obj_scale * 100.0)
         return BatchFeature(data=output_dict)
 
     @torch.no_grad()
@@ -444,6 +475,7 @@ class FlowmatchingActionHead(nn.Module):
             pos_ids = torch.arange(self.action_horizon, dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
 
+        obj_steps = []
         # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)  # e.g. goes 0, 1/N, 2/N, ...
@@ -474,11 +506,18 @@ class FlowmatchingActionHead(nn.Module):
                 timestep=timesteps_tensor,
             )
             pred = self.action_decoder(model_output, embodiment_id)
+            if getattr(self, "obj_head", None) is not None:
+                # gripper->object offset read off the DiT tokens at this denoising step (metres)
+                obj_steps.append(self.obj_head(model_output.mean(dim=1)) / self.aux_obj_scale)
 
             pred_velocity = pred[:, -self.action_horizon :]
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+        if obj_steps:
+            # exposed for test-time steering (eval/rollout_video.py --steer): [B, num_steps, 3] and its mean
+            self.last_obj_pred_steps = torch.stack(obj_steps, dim=1).detach()
+            self.last_obj_pred = self.last_obj_pred_steps.mean(dim=1)
         return BatchFeature(data={"action_pred": actions})
 
     @property

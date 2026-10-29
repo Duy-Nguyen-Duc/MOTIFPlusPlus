@@ -72,7 +72,20 @@ class InferenceWrapper:
         if self.cur_embodiment_tag not in DATA_CONFIG_MAP:
              raise ValueError(f"Tag {self.cur_embodiment_tag} not found in DATA_CONFIG_MAP")
              
-        data_config_obj = DATA_CONFIG_MAP[self.cur_embodiment_tag]
+        # Prefer the data config the checkpoint was trained with for this embodiment (its
+        # config.json lists them per embodiment tag): some configs add batch keys the model
+        # needs at inference, e.g. the raw tcp pose of the *_geo configs (model/geometry_tokens.py).
+        # Falls back to the plain per-tag config when the trained one is unknown here.
+        data_config_name = self.cur_embodiment_tag
+        try:
+            ds = json.load(open(self.cfg_path / "config.json")).get("dataset", {})
+            for tag, name in zip(ds.get("embodiment_tag", []), ds.get("data_config", [])):
+                if tag == self.cur_embodiment_tag and name in DATA_CONFIG_MAP:
+                    data_config_name = name
+        except (OSError, ValueError):
+            pass
+        data_config_obj = DATA_CONFIG_MAP[data_config_name]
+        print(f'data config: {data_config_name}')
         
         self.cur_modality_config = data_config_obj.modality_config()
         self.cur_transform = data_config_obj.transform()

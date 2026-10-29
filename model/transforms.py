@@ -350,6 +350,17 @@ class GR00TTransform(InvertibleModalityTransform):
         # dataset, consumed by the stage-2 trace auxiliary.
         if "ee_to_obj" in data:
             transformed_data["ee_to_obj"] = data["ee_to_obj"]
+        # Raw tcp pose (world, p + q_wxyz) for the stage-3 geometry tokens (*_geo data configs).
+        if "tcp_pose" in data:
+            transformed_data["tcp_pose"] = data["tcp_pose"]
+        # Object trajectory for the causal effect loss (*_rel_prim_obj data configs).
+        for key in ("obj_rel", "obj_valid"):
+            if key in data:
+                transformed_data[key] = data[key]
+        # Primitive labels, present only with the *_rel_prim data configs.
+        for key in ("prim_id", "prim_prog"):
+            if key in data:
+                transformed_data[key] = data[key]
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

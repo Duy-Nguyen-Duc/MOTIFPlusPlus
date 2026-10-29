@@ -547,6 +547,11 @@ class VectorQuantizer(nn.Module):
         self.num_latents = num_latents
 
         self.code_restart = code_restart
+        # Rows [0, reserved) are idle codes pinned by a slot-gated model
+        # (model/stage1_factorized.py, slot_gating): never counted dead and never
+        # a restart source, so they are shaped only by the codebook/commitment
+        # terms of the tokens gated onto them.
+        self.reserved = 0
 
     def update_usage(self, min_enc) -> None:
         """Increment usage counters for the selected code indices.
@@ -565,8 +570,11 @@ class VectorQuantizer(nn.Module):
         """
         if self.code_restart:
             # Codes with usage < 1 are considered dead.
+            reserved = getattr(self, "reserved", 0)
             dead_codes = torch.nonzero(self.usage < 1).squeeze(1)
-            rand_codes = torch.randperm(self.num_latents)[0:len(dead_codes)]
+            dead_codes = dead_codes[dead_codes >= reserved]
+            candidates = torch.arange(reserved, self.num_latents)
+            rand_codes = candidates[torch.randperm(len(candidates))[0:len(dead_codes)]]
             print(f"Restarting {len(dead_codes)} codes")
             with torch.no_grad():
                 self.codebook.weight[dead_codes] = self.codebook.weight[rand_codes]

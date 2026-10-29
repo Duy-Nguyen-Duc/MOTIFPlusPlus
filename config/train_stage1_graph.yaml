@@ -1,0 +1,65 @@
+# Stage 1, graph-routed motif tokenizer (src/train_stage_1_graph.py). Loss = recon + lambda_entropy * H(alpha)
+# + lambda_balance * KL(mean alpha || uniform) + lambda_infonce * InfoNCE(H_m) + lambda_adv * adversarial(H_m).
+defaults:
+  - dataset: dataset_maniskill_prim
+  - models: model_graph_elora_geod
+  - optim: adamw_cosine
+  - _self_
+
+seed: 42
+device: cuda:0
+
+output_dir: outputs_stage1_graph
+
+K: 5
+window_size: 32
+local_w: 16
+batch_size: 128
+add_latent_action: false
+
+lambda_entropy: 0.01
+lambda_balance: 0.1
+entropy_ramp_epochs: 3
+lambda_effect: 0.0            # causal effect loss, off
+effect_clip: 1.0
+
+add_info_NCE: true
+lambda_infonce: 0.1
+infonce_cond: primitive       # task | primitive
+infonce_sigma: 0.1
+infonce_min_weight: 0.001
+
+use_adversarial: true
+num_robots: 3
+num_progress_bins: 4
+lambda_adv: 0.1
+prim_conditioning: true
+
+tasks_num: 6
+balance_tasks: true
+
+train:
+  epochs: 20
+  grad_accum_steps: 1
+  grad_clip_norm: 1.0
+  iters_per_epoch: 0
+  log_interval: 1
+  ckpt_interval: 10
+
+wandb:
+  enable: false
+  project: "MOTIF-stage1"
+  name: "${now:%Y-%m-%d}/${now:%H-%M-%S}"
+  tags: ["stage1", "graph"]
+  notes: null
+  offline: false
+  log_code: false
+  watch: false
+  watch_log: "gradients"
+  watch_freq: 10
+  log_ckpt: false
+
+hydra:
+  run:
+    dir: ${output_dir}
+  output_subdir: null

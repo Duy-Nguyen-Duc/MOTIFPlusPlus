@@ -221,6 +221,8 @@ runs/
 # Object-augmented dataset copy (data/process/append_object_action_dims.py);
 # regenerable, videos are symlinks into demo_data_processed/
 demo_data_processed_obj/
+# regenerable by data/process/label_primitives.py, videos are symlinks
+demo_data_processed_prim/
 
 # internal server/infra notes - not for the public repo
 AI_AGENTS_SETUP.md

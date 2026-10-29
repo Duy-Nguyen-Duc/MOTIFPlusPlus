@@ -204,6 +204,8 @@ class PANDAWithRELDataConfig(BaseDataConfig):
     language_keys = ["annotation.human.task_description"]
     observation_indices = [0]
     action_indices = list(range(16))
+    # Action keys loaded but never normalized (labels / progress, not motion).
+    no_norm_action_keys = ("action.progress",)
 
     def transform(self):
         transforms = [
@@ -229,7 +231,8 @@ class PANDAWithRELDataConfig(BaseDataConfig):
             StateActionToTensor(apply_to=self.action_keys),
             StateActionTransform(
                 apply_to=self.action_keys,
-                normalization_modes={key: "min_max" for key in self.action_keys if key != "action.progress"},
+                normalization_modes={key: "min_max" for key in self.action_keys
+                                     if key not in self.no_norm_action_keys},
             ),
             # concat transforms
             ConcatTransform(
@@ -368,6 +371,56 @@ class PANDAWithRELObjDataConfig(PANDAWithRELDataConfig):
     action_keys = PANDAWithRELDataConfig.action_keys + ["action.ee_to_obj"]
 
 
+class PANDAWithRELPrimDataConfig(PANDAWithRELDataConfig):
+    """RELData plus per-frame primitive labels (action.prim_id, action.prim_prog).
+
+    Opt-in like *_rel_obj: only embodiments registered as *_rel_prim load the
+    two columns, which exist only in the dataset built by
+    data/process/label_primitives.py. The concat transform routes them to
+    batch["prim_id"] / batch["prim_prog"]; they are not normalized and never
+    enter the action target.
+    """
+    action_keys = PANDAWithRELDataConfig.action_keys + ["action.prim_id", "action.prim_prog"]
+    no_norm_action_keys = ("action.progress", "action.prim_id", "action.prim_prog")
+
+
+class PANDAWithRELPrimGeoDataConfig(PANDAWithRELPrimDataConfig):
+    """*_rel_prim + the raw tcp pose in batch["tcp_pose"] (data/transform/tcp_pose.py) for the
+    stage-3 geometry tokens (model/geometry_tokens.py). Normalised state/action unchanged."""
+
+    def transform(self):
+        from data.transform.tcp_pose import TcpPosePassthrough
+        transforms = list(super().transform().transforms)
+        first_state = next(i for i, t in enumerate(transforms)
+                           if isinstance(t, StateActionToTensor) and t.apply_to == self.state_keys)
+        transforms.insert(first_state, TcpPosePassthrough(apply_to=["state.position", "state.rotation"]))
+        return ComposedModalityTransform(transforms=transforms)
+
+
+class PANDAWithRELPrimObjDataConfig(PANDAWithRELPrimDataConfig):
+    """RELPrim plus the manipulated object's trajectory (action.obj_rel, action.obj_valid).
+
+    Opt-in like *_rel_prim: only *_rel_prim_obj embodiments load the columns, which
+    exist only in the dataset built by data/process/append_object_rel.py. Kept in
+    raw metres (no normalisation): the causal effect loss scales and clips them
+    itself, so one outlier episode cannot squash every other robot's range.
+    """
+    action_keys = PANDAWithRELPrimDataConfig.action_keys + ["action.obj_rel", "action.obj_valid"]
+    no_norm_action_keys = PANDAWithRELPrimDataConfig.no_norm_action_keys + (
+        "action.obj_rel", "action.obj_valid")
+
+
+class PANDAWithRELPrimObjEEDataConfig(PANDAWithRELPrimObjDataConfig):
+    """RELPrimObj plus the gripper->object offset of every frame (action.ee_to_obj).
+
+    Built by data/process/append_object_rel.py --ee-to-obj (demo_data_processed_prim_obj_ee).
+    Raw metres, no normalisation; concat.py routes it to batch["ee_to_obj"] [T, 3] for the
+    stage-3 auxiliary object-offset loss (flow head aux_obj_weight).
+    """
+    action_keys = PANDAWithRELPrimObjDataConfig.action_keys + ["action.ee_to_obj"]
+    no_norm_action_keys = PANDAWithRELPrimObjDataConfig.no_norm_action_keys + ("action.ee_to_obj",)
+
+
 class PANDAWithRELPairDataConfig(PANDAWithRELDataConfig):
     """Two observation timesteps instead of one, for the DINO-target stage 1.
 
@@ -426,6 +479,18 @@ DATA_CONFIG_MAP = {
     'panda_rel_obj': PANDAWithRELObjDataConfig(),
     'xarm6_rel_obj': PANDAWithRELObjDataConfig(),
     'widowxai_rel_obj': PANDAWithRELObjDataConfig(),
+    'panda_rel_prim': PANDAWithRELPrimDataConfig(),
+    'xarm6_rel_prim': PANDAWithRELPrimDataConfig(),
+    'widowxai_rel_prim': PANDAWithRELPrimDataConfig(),
+    'panda_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'xarm6_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'widowxai_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'panda_rel_prim_obj': PANDAWithRELPrimObjDataConfig(),
+    'xarm6_rel_prim_obj': PANDAWithRELPrimObjDataConfig(),
+    'widowxai_rel_prim_obj': PANDAWithRELPrimObjDataConfig(),
+    'panda_rel_prim_obj_ee': PANDAWithRELPrimObjEEDataConfig(),
+    'xarm6_rel_prim_obj_ee': PANDAWithRELPrimObjEEDataConfig(),
+    'widowxai_rel_prim_obj_ee': PANDAWithRELPrimObjEEDataConfig(),
     'panda_rel_pair': PANDAWithRELPairDataConfig(),
     'xarm6_rel_pair': PANDAWithRELPairDataConfig(),
     'widowxai_rel_pair': PANDAWithRELPairDataConfig(),

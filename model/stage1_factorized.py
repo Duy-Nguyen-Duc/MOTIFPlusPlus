@@ -52,6 +52,7 @@ from model.stage1 import (
     LocalTransformerDecoder,
     GradientReversal,
 )
+from model.primitive_tying import DEFAULT_SLOT_MASK, frames_to_tokens
 
 # (name, start, end) into the 8-D canonicalized rel_state:
 # xyz | wxyz quaternion | gripper
@@ -97,6 +98,10 @@ class FactorizedActionMotifLearning(ActionMotifLearning):
         rvq_levels: int = 1,
         per_slot_codebook: bool = False,
         gripper_convention: str = LEGACY,
+        slot_gating: bool = False,
+        slot_mask: List[List[int]] = None,
+        num_primitives: int = 7,
+        idle_margin: float = 0.0,
     ):
         # Build the parent with the same hyperparameters, then discard its single
         # encoder/decoder: we reuse its VQ, loss and codebook-statistics helpers.
@@ -207,6 +212,34 @@ class FactorizedActionMotifLearning(ActionMotifLearning):
             self.grip_film = nn.Embedding(16, 2 * latent_dim)
             nn.init.zeros_(self.grip_film.weight)  # identity at start
 
+        # Primitive -> slot tying (model/primitive_tying.py). With per-frame
+        # primitive labels in the batch (batch["prim_id"], *_rel_prim data
+        # config), every slot the current primitive does not use is forced onto
+        # that slot's reserved idle code: codebook row s for slot s. The usual
+        # codebook/commitment terms then pull both the idle vector and the
+        # encoder output together, so at inference -- no labels, plain
+        # nearest-neighbour -- an inactive slot lands on idle by itself. Slot
+        # tokens the primitive does use quantize freely over the whole codebook
+        # (idle included, so a genuinely still slot may still say so). Small
+        # residual motion in an idle slot is explained by the cross-slot decoder
+        # mix from the active slots' codes, not by the idle slot's own code.
+        # Without labels (stage 2/3 teacher calls) the forward is unchanged.
+        self.slot_gating = slot_gating
+        self.gate_with_labels = True
+        self.num_primitives = num_primitives
+        # > 0: hinge on inactive tokens, d(z_e, idle) + margin <= d(z_e, nearest other code)
+        self.idle_margin = float(idle_margin)
+        if slot_gating:
+            if per_slot_codebook or rvq_levels > 1:
+                raise ValueError("slot_gating needs the plain shared VectorQuantizer")
+            table = torch.tensor(slot_mask if slot_mask is not None else DEFAULT_SLOT_MASK,
+                                 dtype=torch.float32)
+            if tuple(table.shape) != (num_primitives, S):
+                raise ValueError(f"slot_mask must be [{num_primitives}, {S}], got {tuple(table.shape)}")
+            # Not persisted: the config carries it, and old checkpoints stay loadable.
+            self.register_buffer("slot_mask_table", table, persistent=False)
+            self.vq.reserved = S
+
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
         check_checkpoint_convention(
@@ -217,6 +250,16 @@ class FactorizedActionMotifLearning(ActionMotifLearning):
             missing_keys, unexpected_keys, error_msgs,
         )
 
+    def _slot_gate(self, batch: Dict[str, torch.Tensor], n_tokens: int):
+        """Per-token (primitive id, slot gate) from per-frame labels, or (None, None)."""
+        if not self.slot_gating or batch.get("prim_id") is None:
+            return None, None
+        prim = batch["prim_id"]
+        prim_tok = frames_to_tokens(prim.long().view(prim.shape[0], -1), n_tokens)   # [B, M]
+        prim_tok = prim_tok.clamp(0, self.num_primitives - 1)
+        gate = self.slot_mask_table[prim_tok] if self.gate_with_labels else None      # [B, M, S]
+        return gate, prim_tok
+
     def forward(self, batch: Dict[str, torch.Tensor], causal_attn: bool = False):
         progress, state_seq = batch["progress"], batch["rel_state"]
         if self.gripper_convention != LEGACY:
@@ -224,13 +267,39 @@ class FactorizedActionMotifLearning(ActionMotifLearning):
                 raise ValueError("Teacher expects legacy rel_state; do not canonicalize twice")
             state_seq = reflect_relative_gripper(state_seq, batch.get("embodiment_id"))
 
-        z_e_list, z_q_list, z_list, idx_list = [], [], [], []
-        for i, (_, s, e) in enumerate(self.slots):
-            z_e_i = self.encoders[i](state_seq[..., s:e], progress, causal=causal_attn)
+        z_e_list = [self.encoders[i](state_seq[..., s:e], progress, causal=causal_attn)
+                    for i, (_, s, e) in enumerate(self.slots)]
+        gate, prim_tok = self._slot_gate(batch, z_e_list[0].shape[1])
+
+        z_q_list, z_list, idx_list, idx_nn_list, margin_terms = [], [], [], [], []
+        for i in range(self.num_slots):
+            z_e_i = z_e_list[i]
             z_q_i, z_i, _, idx_i, _ = (self.vq(z_e_i, slot=i) if self.per_slot_codebook
                                        else self.vq(z_e_i))
-            z_e_list.append(z_e_i); z_q_list.append(z_q_i)
-            z_list.append(z_i); idx_list.append(idx_i)
+            idx_nn_list.append(idx_i)                      # free nearest-neighbour choice
+            if gate is not None:
+                active = gate[:, :, i] > 0.5                  # [B, M]
+                idx_i = torch.where(active, idx_i, torch.full_like(idx_i, i))
+                z_i = self.vq.codebook(idx_i)                 # re-lookup keeps codebook grads
+                # Inactive tokens feed the idle row itself to the decoder (gradient
+                # into the row), with no straight-through path to the encoder: with
+                # ST the recon gradient kept pushing z_e while the decoder input never
+                # moved, so inactive z_e drifted away from idle (vq_loss rose and the
+                # free nearest neighbour picked other codes). Only the commitment term
+                # in compute_loss now ties inactive z_e to the idle row.
+                z_q_i = torch.where(active.unsqueeze(-1), z_q_i, z_i)
+                if self.idle_margin > 0 and self.training and (~active).any():
+                    # Free nearest neighbour must land on idle for inactive tokens:
+                    # the commitment term alone leaves them within ~1 unit of idle
+                    # while active codes for tiny motions sit just as close.
+                    # Codebook detached: with codebook gradients the hinge scattered
+                    # the active codes (vq loss x10, recon x2); only the encoder moves.
+                    d = torch.cdist(z_e_i[~active], self.vq.codebook.weight.detach())  # [n, K]
+                    d_other = d[:, self.num_slots:].min(1).values
+                    margin_terms.append(F.relu(d[:, i] - d_other + self.idle_margin))
+                with torch.no_grad():                         # usage credit for forced idle
+                    self.vq.usage[i] += (~active).sum()
+            z_q_list.append(z_q_i); z_list.append(z_i); idx_list.append(idx_i)
 
         if self.cross_slot:
             ctx = torch.cat(z_q_list, dim=-1)          # [B, H_ds, S*latent]
@@ -267,6 +336,13 @@ class FactorizedActionMotifLearning(ActionMotifLearning):
             idx=torch.cat(idx_list, dim=1),            # [B, S*H_ds]
             idx_per_slot=torch.stack(idx_list, dim=1), # [B, S, H_ds] for analysis
         )
+        if self.slot_gating:
+            out["idx_nn_per_slot"] = torch.stack(idx_nn_list, dim=1)   # [B, S, H_ds] before gating
+        if prim_tok is not None:
+            out["prim_tok"] = prim_tok                                 # [B, H_ds]
+            out["slot_gate"] = self.slot_mask_table[prim_tok]           # [B, H_ds, S]
+        if margin_terms:
+            out["idle_margin_loss"] = torch.cat(margin_terms).mean()
 
         if self.latent_dynamics:
             dyn = 0.0

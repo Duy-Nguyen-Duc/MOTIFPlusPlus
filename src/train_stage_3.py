@@ -1,4 +1,5 @@
 import os
+import errno
 import glob
 import time
 import json
@@ -26,6 +27,46 @@ from train_utils import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _is_fs_error(e):
+    """Transient filesystem failure (quota / no space / IO) rather than a bug or CUDA error."""
+    if isinstance(e, OSError):
+        return e.errno in (errno.EDQUOT, errno.ENOSPC, errno.EIO)
+    s = str(e)
+    return "PytorchStreamWriter" in s or "file write failed" in s or "unexpected pos" in s
+
+
+def save_checkpoint(payload, path, tries=40, wait=90.0):
+    """torch.save through a temp file + rename, retried on transient filesystem errors.
+
+    The workspace fileset shares a GPFS quota with other projects; when it is full, torch.save
+    raises RuntimeError (PytorchStreamWriter ... file write failed) or OSError (EDQUOT/ENOSPC).
+    Crashing there cost three resumes on 2026-10-21, so wait and retry instead. Returns True
+    on success. tries=None retries until the write succeeds (used for the final epoch, whose
+    file the chain scripts wait for).
+    """
+    tmp = path + ".tmp"
+    n = 0
+    while True:
+        n += 1
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, path)
+            return True
+        except (RuntimeError, OSError) as e:
+            if not _is_fs_error(e):
+                raise
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if tries is not None and n >= tries:
+                log.error(f"=> giving up on {path} after {n} attempts: {e}")
+                return False
+            log.warning(f"=> save of {path} failed (attempt {n}: {e}); retrying in {wait:.0f}s")
+            time.sleep(wait)
+
 
 @hydra.main(version_base=None, config_path="../config", config_name="train_stage3")
 def main(cfg: DictConfig):
@@ -143,6 +184,17 @@ def main(cfg: DictConfig):
                         "uninterrupted one")
 
     # Train loop
+    # Fine-tuning: weights only (strict=False, so new heads start fresh), fresh
+    # optimizer and schedule. Ignored once a resume checkpoint exists in out_dir,
+    # so resume_from=auto keeps working across relaunches.
+    init_from = cfg.train.get("init_from", None)
+    if init_from and not resume_from:
+        ck = torch.load(init_from, map_location="cpu")
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        frozen = ("mkl.dino_encoder.", "mkl.text_encoder.")
+        log.info(f"=> initialised weights from {init_from} (epoch {ck.get('epoch')}), fresh optimizer/schedule")
+        log.info(f"   missing (new) keys: {[k for k in missing if not k.startswith(frozen)]}; unexpected: {list(unexpected)}")
+
     for epoch in range(start_epoch, cfg.train.epochs + 1):
         model.train()
         # Kept on the GPU: a per-step .item() would sync the host every iteration.
@@ -206,6 +258,8 @@ def main(cfg: DictConfig):
                     "loss": raw_loss.item(),
                     "grad_norm": grad_norm,
                 }
+                for k, v in (getattr(model, "last_aux", None) or {}).items():
+                    log_payload[k] = float(v)
                 log.info(json.dumps(log_payload, ensure_ascii=False))
 
                 if wandb_run is not None:
@@ -287,17 +341,18 @@ def main(cfg: DictConfig):
         }
 
         # Rolling per-epoch checkpoint (numbered ones only start at skip_epochs).
-        # Temp-file + rename so a crash mid-write cannot leave a truncated file.
+        # Temp-file + rename so a crash mid-write cannot leave a truncated file; writes are
+        # retried while the shared quota is exhausted (see save_checkpoint).
         last_path = os.path.join(out_dir, "last.pth")
-        torch.save(payload, last_path + ".tmp")
-        os.replace(last_path + ".tmp", last_path)
+        save_checkpoint(payload, last_path)
 
         if is_after_skip and (is_checkpoint_interval or is_last_epoch):
             ckpt_path = os.path.join(out_dir, f"epoch_{epoch:04d}.pth")
-            torch.save(payload, ckpt_path)
-            log.info(f"=> saved {ckpt_path}")
+            saved = save_checkpoint(payload, ckpt_path, tries=None if is_last_epoch else 40)
+            if saved:
+                log.info(f"=> saved {ckpt_path}")
 
-            if wandb_run is not None and cfg.wandb.get("log_ckpt", False):
+            if saved and wandb_run is not None and cfg.wandb.get("log_ckpt", False):
                 artifact = wandb.Artifact(
                     name=f"ckpt-epoch-{epoch:04d}",
                     type="model",

@@ -21,6 +21,14 @@ class MOTIFCollator:
             'progress': torch.float32,
             # Only present with the object-augmented dataset; absent keys are skipped.
             'ee_to_obj': torch.float32,
+            # Primitive labels, only with the *_rel_prim data configs.
+            'prim_id': torch.long,
+            'prim_prog': torch.float32,
+            # Object trajectory, only with the *_rel_prim_obj data configs.
+            'obj_rel': torch.float32,
+            'obj_valid': torch.float32,
+            # Raw tcp pose, only with the *_geo data configs (model/geometry_tokens.py).
+            'tcp_pose': torch.float32,
         }
 
     @staticmethod

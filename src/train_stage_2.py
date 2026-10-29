@@ -110,12 +110,13 @@ def main(cfg: DictConfig):
     start_epoch = 1
 
     # Resume support: checkpoints carry optimizer/scheduler/RNG so a resumed run
-    # continues the same schedule and data stream. Stage 2 has no last.pth --
-    # only the interval checkpoints exist, so "auto" picks the newest of those.
+    # continues the same schedule and data stream. "auto" picks the rolling last.pth,
+    # else the newest interval checkpoint.
     resume_from = cfg.train.get("resume_from", None)
     if resume_from == "auto":
+        last = os.path.join(out_dir, "last.pth")
         existing = sorted(glob.glob(os.path.join(out_dir, "epoch_*.pth")))
-        resume_from = existing[-1] if existing else None
+        resume_from = last if os.path.exists(last) else (existing[-1] if existing else None)
     if resume_from:
         log.info(f"=> resuming from {resume_from}")
         ck = torch.load(resume_from, map_location="cpu")
@@ -251,6 +252,17 @@ def main(cfg: DictConfig):
                 },
                 step=global_iters,
             )
+
+        # Rolling per-epoch checkpoint (stage-2 weights only) so resume_from=auto loses at
+        # most one epoch after a kill; temp file + rename keeps it atomic.
+        _state = {k: v for k, v in model.state_dict().items()
+                  if not k.startswith(("vq_vae.", "dino_encoder.", "text_encoder."))}
+        _last = os.path.join(out_dir, "last.pth")
+        torch.save({"epoch": epoch, "model": _state, "optimizer": optim.state_dict(),
+                    "scheduler": sched.state_dict(), "global_iters": global_iters, "rng": rng_state(),
+                    "cfg": OmegaConf.to_container(cfg, resolve=True)}, _last + ".tmp")
+        os.replace(_last + ".tmp", _last)
+        del _state
 
         # Save weights
         if epoch % cfg.train.ckpt_interval == 0 or (epoch == cfg.train.epochs and epoch % cfg.train.ckpt_interval != 0):
