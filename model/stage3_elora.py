@@ -38,29 +38,38 @@ class GraphELoRARouter(nn.Module):
         if getattr(self.task_embed, "proj", None) is not None:
             # Frozen T5 features are identical for both: reuse the teacher's encoder/cache.
             self.task_embed._encode = teacher.task_embed._encode
+        if self.gnn is None:                    # no-graph teacher: one node per robot, from its learned vector
+            self.embodiment_embed = copy.deepcopy(teacher.embodiment_embed)
+            hidden, self.num_nodes = self.embodiment_embed.embedding_dim, self.embodiment_embed.num_embeddings
+        else:
+            hidden, self.num_nodes = self.gnn.in_proj.out_features, int(self.gnn.gid.numel())
         for p in self.parameters():
             p.requires_grad_(True)
         self.register_buffer("emb2graph", teacher.emb2graph.clone(), persistent=False)
-        hidden = self.gnn.in_proj.out_features
         self.gate = nn.Sequential(nn.Linear(hidden, gate_hidden), nn.ReLU(), nn.Linear(gate_hidden, 1))
-        self.num_nodes = int(self.gnn.gid.numel())
 
     def forward(self, embodiment_id: torch.Tensor, languages: List[str]):
         device = embodiment_id.device
-        uniq = list(dict.fromkeys(languages))
-        e_task = self.task_embed(uniq, device)
-        with _deterministic_kernels():
-            outs = [self.gnn(e_task[u]) for u in range(len(uniq))]
-        g_table = torch.stack([o[0] for o in outs])                 # [U, R, Dg]
-        n_table = torch.stack([o[1] for o in outs])                 # [U, N, Dg]
-        u_idx = torch.tensor([uniq.index(l) for l in languages], device=device)
         r_idx = self.emb2graph[embodiment_id.long().view(-1)]
         if (r_idx < 0).any():
             raise ValueError(f"no kinematic graph for embodiment ids "
                              f"{embodiment_id.view(-1)[r_idx < 0].unique().tolist()}")
-        g = g_table[u_idx, r_idx]                                   # [B, Dg]
-        n = n_table[u_idx]                                          # [B, N, Dg]
-        on_robot = (self.gnn.gid.unsqueeze(0) == r_idx.unsqueeze(1)).to(n.dtype)   # [B, N]
+        if self.gnn is None:
+            g = self.embodiment_embed(r_idx)                        # [B, Dg]
+            n = self.embodiment_embed.weight.unsqueeze(0).expand(len(r_idx), -1, -1)   # [B, R, Dg]
+            node_robot = torch.arange(self.num_nodes, device=device)
+        else:
+            uniq = list(dict.fromkeys(languages))
+            e_task = self.task_embed(uniq, device)
+            with _deterministic_kernels():
+                outs = [self.gnn(e_task[u]) for u in range(len(uniq))]
+            g_table = torch.stack([o[0] for o in outs])             # [U, R, Dg]
+            n_table = torch.stack([o[1] for o in outs])             # [U, N, Dg]
+            u_idx = torch.tensor([uniq.index(l) for l in languages], device=device)
+            g = g_table[u_idx, r_idx]                               # [B, Dg]
+            n = n_table[u_idx]                                      # [B, N, Dg]
+            node_robot = self.gnn.gid
+        on_robot = (node_robot.unsqueeze(0) == r_idx.unsqueeze(1)).to(n.dtype)   # [B, N]
         gates = torch.sigmoid(self.gate(n).squeeze(-1)) * on_robot
         return g, gates, n
 

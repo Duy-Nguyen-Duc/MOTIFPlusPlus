@@ -28,6 +28,16 @@ EMBODIMENT_TAGS = {
     "widowxai_wristcam_rel": "widowxai_rel",
     "xarm7_robotiq_wristcam_rel": 'xarm7_rel',
 
+    # robosuite (robomimic benchmark)
+    "rs_panda": "rs_panda",
+    "rs_iiwa": "rs_iiwa",
+    "rs_ur5e": "rs_ur5e",
+    "rs_kinova3": "rs_kinova3",
+    "rs_panda_rel": "rs_panda_rel",
+    "rs_iiwa_rel": "rs_iiwa_rel",
+    "rs_ur5e_rel": "rs_ur5e_rel",
+    "rs_kinova3_rel": "rs_kinova3_rel",
+
     # Real world environments
     "piper_real": 'piper_real',
     "arx5_real": 'arx5_real',
@@ -48,6 +58,14 @@ class EmbodimentTag(Enum):
     XARM7_REL = "xarm7_rel"
     PANDA_REL = "panda_rel"
     WIDOWXAI_REL = "widowxai_rel" 
+    RS_PANDA = "rs_panda"
+    RS_IIWA = "rs_iiwa"
+    RS_UR5E = "rs_ur5e"
+    RS_KINOVA3 = "rs_kinova3"
+    RS_PANDA_REL = "rs_panda_rel"
+    RS_IIWA_REL = "rs_iiwa_rel"
+    RS_UR5E_REL = "rs_ur5e_rel"
+    RS_KINOVA3_REL = "rs_kinova3_rel"
 
     ARX5_REAL = "arx5_real"
     PIPER_REAL = "piper_real"
@@ -67,6 +85,14 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.PANDA_REL.value: 1,
     EmbodimentTag.XARM7_REL.value: 2,
     EmbodimentTag.WIDOWXAI_REL.value: 3,
+    EmbodimentTag.RS_PANDA.value: 10,
+    EmbodimentTag.RS_IIWA.value: 11,
+    EmbodimentTag.RS_UR5E.value: 12,
+    EmbodimentTag.RS_KINOVA3.value: 13,
+    EmbodimentTag.RS_PANDA_REL.value: 10,
+    EmbodimentTag.RS_IIWA_REL.value: 11,
+    EmbodimentTag.RS_UR5E_REL.value: 12,
+    EmbodimentTag.RS_KINOVA3_REL.value: 13,
 
     EmbodimentTag.ARX5_REAL.value: 6,
     EmbodimentTag.PIPER_REAL.value: 7,

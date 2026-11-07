@@ -1,14 +1,4 @@
-"""LeRobotSingleDataset variant that reads frames from a pre-decoded frame cache
-(built by data/process/prextract_frames.py) instead of seeking mp4s per sample.
 
-Only `get_video` is overridden. The converter writes exactly one frame per
-parquet row at constant fps, so the parent's timestamp->frame mapping is the
-identity and the cache can be indexed with step indices directly.
-
-Two cache formats (see prextract_frames.py): "raw" uint8 memmaps, and "webp"
-(concatenated lossless WebP frames + an int64 byte index). Both return the same
-uint8 (T, H, W, 3) arrays; the WebP path decodes with cv2 at ~1 ms per frame.
-"""
 
 import json
 from pathlib import Path
@@ -17,7 +7,8 @@ import numpy as np
 
 from .dataset import LeRobotSingleDataset
 
-
+# LeRobotSingleDataset reading frames from the cache of data/process/prextract_frames.py (raw uint8 memmap or
+# concatenated lossless WebP + byte index) instead of seeking mp4s; one frame per parquet row, so step index == frame.
 class FrameCachedLeRobotSingleDataset(LeRobotSingleDataset):
     def __init__(self, *args, frame_cache_dir: str | Path, **kwargs):
         self._frame_cache_dir = Path(frame_cache_dir)
@@ -41,8 +32,7 @@ class FrameCachedLeRobotSingleDataset(LeRobotSingleDataset):
                 idx = np.load((self._frame_cache_dir / f"frames_{alias}.idx.npy").as_posix())
                 self._blob[alias] = (blob, idx, tuple(meta["shape"][1:]))
             else:
-                # mmap_mode='r' -- workers share one page-cache copy instead of each
-                # materialising the array.
+                # mmap_mode='r': workers share one page-cache copy
                 self._cache[alias] = np.load(
                     (self._frame_cache_dir / f"frames_{alias}.u8").as_posix(), mmap_mode="r")
 

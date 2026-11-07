@@ -16,9 +16,7 @@ DEFAULT_SLOT_MASK: List[List[int]] = [
 
 
 def frames_to_tokens(x: torch.Tensor, n_tokens: int) -> torch.Tensor:
-    """
-    Per-frame labels [B, H] -> per-token labels [B, n_tokens].
-    """
+    """Per-frame labels [B, H] -> per-token labels [B, n_tokens]."""
     if x.dim() != 2:
         raise ValueError(f"expected [B, H], got {tuple(x.shape)}")
     H = x.shape[1]
@@ -28,9 +26,7 @@ def frames_to_tokens(x: torch.Tensor, n_tokens: int) -> torch.Tensor:
 
 
 def boundary_counts(gt_change: torch.Tensor, pred_change: torch.Tensor, tol: int = 1):
-    """
-    Match boundaries with +-tol token tolerance. Both [B, M-1] bool.
-    """
+    """Boundary matches with +-tol token tolerance; both [B, M-1] bool -> (tp, fp, fn)."""
     def dilate(m):
         k = 2 * tol + 1
         return torch.nn.functional.max_pool1d(m.float().unsqueeze(1), k, stride=1, padding=tol
@@ -43,11 +39,8 @@ def boundary_counts(gt_change: torch.Tensor, pred_change: torch.Tensor, tol: int
 
 
 class PrimitiveTyingMeter:
-    """
-    Accumulates how well free code choices follow the slot mask.
-    update() takes the nearest-neighbour code per slot token BEFORE label
-    gating, and idle codes are the reserved codebook rows [0, num_slots).
-    """
+    """How well free code choices follow the slot mask: update() takes the nearest code per slot token before
+    label gating; idle codes are the reserved rows [0, num_slots)."""
 
     def __init__(self, num_primitives: int, num_slots: int, slot_mask: Optional[torch.Tensor] = None,
                  tol: int = 1):
@@ -95,7 +88,7 @@ class PrimitiveTyingMeter:
             seen = (self.total > 0).numpy()
             err = abs(rate - mask)[seen]
             out["mask_agreement"] = float(1.0 - err.mean()) if err.size else float("nan")
-            # the two halves of the claim: active slots stay on, inactive slots go idle
+            # active slots stay on, inactive slots go idle
             on = rate[(mask > 0.5) & seen]
             off = rate[(mask < 0.5) & seen]
             out["active_slot_on_rate"] = float(on.mean()) if on.size else float("nan")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Dict, List, Optional
@@ -28,9 +29,7 @@ DEFAULT_ROBOTS = {"panda": "panda_rel", "xarm6": "xarm6_rel", "widowxai": "widow
 
 # --------------------------------------------------------------------------- text
 class TaskTextEmbedder(nn.Module):
-    """
-    e_task = L(instruction) from a frozen encoder, then a trainable projection.
-    """
+    """e_task = L(instruction) from a frozen encoder, then a trainable projection."""
 
     def __init__(self, out_dim: int, text_encoder: str = "t5-base"):
         super().__init__()
@@ -72,10 +71,6 @@ class TaskTextEmbedder(nn.Module):
 
 # --------------------------------------------------------------------------- GNN
 class MPNNLayer(nn.Module):
-    """
-    Message Passing Neural Network Layer.
-    """
-
     def __init__(self, hidden: int, d_edge: int, d_task: int, layer_norm: bool = True):
         super().__init__()
         self.w_self = nn.Linear(hidden, hidden)
@@ -84,18 +79,39 @@ class MPNNLayer(nn.Module):
         self.norm = nn.LayerNorm(hidden) if layer_norm else nn.Identity()
 
     def forward(self, n, src, dst, e, e_task_nodes):
-        # message j -> i along edge (src=j, dst=i); N(i) = all j with an edge into i
-        m = self.msg(torch.cat([n[dst], n[src], e, e_task_nodes[dst]], dim=-1))
-        agg = torch.zeros(n.shape, dtype=m.dtype, device=n.device).index_add_(0, dst, m)   # m may be bf16 under autocast
+        # message j -> i along edge (src=j, dst=i); n [N, H] (static) or [B, N, H] (per sample), e / e_task_nodes alike
+        m = self.msg(torch.cat([n[..., dst, :], n[..., src, :], e, e_task_nodes[..., dst, :]], dim=-1))
+        agg = torch.zeros(n.shape, dtype=m.dtype, device=n.device).index_add_(n.dim() - 2, dst, m)   # m may be bf16 under autocast
         return self.norm(F.relu(self.w_self(n) + agg))
 
 
+class TemporalEncoder(nn.Module):
+    """Joint trajectories [..., C, T] -> [..., out]: two strided 1-D convs, pooled to `steps` bins, flattened."""
+
+    def __init__(self, in_ch: int, out: int, hidden: int = 32, steps: int = 8):
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv1d(in_ch, hidden // 2, 5, stride=2, padding=2), nn.ReLU(),
+                                  nn.Conv1d(hidden // 2, hidden, 5, stride=2, padding=2), nn.ReLU())
+        self.steps = steps
+        self.out = nn.Linear(hidden * steps, out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lead = x.shape[:-2]
+        y = self.conv(x.reshape(-1, *x.shape[-2:]))
+        y = F.adaptive_avg_pool1d(y, self.steps).flatten(1)
+        return self.out(y).view(*lead, -1)
+
+
 class TaskConditionedMPNN(nn.Module):
-    """L message-passing layers over the disjoint union of the robot graphs, then
-    mean-pool per graph -> g_r [R, hidden] for one task embedding."""
+    """L message-passing layers over the disjoint union of the robot graphs, mean-pooled per graph -> g_r.
+    temporal_dim > 0: nodes also encode their joint's trajectory over the window (limit-normalised position
+    + per-step change) and edges the trajectories of both joints; the forward is then per sample."""
+
+    DELTA_SCALE = 10.0      # per-step change of the normalised joint position, scaled to O(0.1-1)
 
     def __init__(self, graphs: List[KinematicGraph], d_task: int, hidden: int = 128,
-                 layers: int = 3, layer_norm: bool = True):
+                 layers: int = 3, layer_norm: bool = True, temporal_dim: int = 0,
+                 qpos_layout: Optional[List[dict]] = None):
         super().__init__()
         x, src, dst, e, gid = [], [], [], [], []
         offset = 0
@@ -112,31 +128,105 @@ class TaskConditionedMPNN(nn.Module):
         self.register_buffer("e", torch.cat(e), persistent=False)
         self.register_buffer("gid", torch.cat(gid), persistent=False)
         self.num_graphs = len(graphs)
-        self.in_proj = nn.Linear(self.x.shape[1], hidden)
-        self.layers = nn.ModuleList([MPNNLayer(hidden, self.e.shape[1], d_task, layer_norm)
+        d_node, d_edge = self.x.shape[1], self.e.shape[1]
+        self.temporal_dim = int(temporal_dim)
+        if self.temporal_dim > 0:
+            if qpos_layout is None or len(qpos_layout) != len(graphs):
+                raise ValueError("temporal graph needs one qpos layout per robot graph")
+            # per node: column of its joint in the robot's padded qpos vector (-1: no DoF) and the limits
+            col, lo, hi = [], [], []
+            for g, lay in zip(graphs, qpos_layout):
+                pos = {name: k for k, name in enumerate(lay["joints"])}
+                for name in g.node_names:
+                    k = pos.get(name, -1)
+                    col.append(k)
+                    lo.append(lay["lower"][k] if k >= 0 else 0.0)
+                    hi.append(lay["upper"][k] if k >= 0 else 1.0)
+            self.register_buffer("q_col", torch.tensor(col), persistent=False)
+            self.register_buffer("q_lo", torch.tensor(lo, dtype=torch.float32), persistent=False)
+            self.register_buffer("q_hi", torch.tensor(hi, dtype=torch.float32), persistent=False)
+            self.node_tenc = TemporalEncoder(2, self.temporal_dim)      # [q, dq] of the node's joint
+            self.edge_tenc = TemporalEncoder(4, self.temporal_dim)      # [q, dq] of src and of dst
+            d_node += self.temporal_dim + 1                             # + has-DoF flag
+            d_edge += self.temporal_dim
+        self.in_proj = nn.Linear(d_node, hidden)
+        self.layers = nn.ModuleList([MPNNLayer(hidden, d_edge, d_task, layer_norm)
                                      for _ in range(layers)])
         counts = torch.bincount(self.gid, minlength=self.num_graphs).float()
         self.register_buffer("inv_counts", 1.0 / counts.clamp_min(1.0), persistent=False)
 
-    def forward(self, e_task: torch.Tensor) -> torch.Tensor:
-        """e_task: [d_task] (one task) -> g: [R, hidden], node embeddings [N, hidden]."""
-        n = self.in_proj(self.x)
-        e_task_nodes = e_task.unsqueeze(0).expand(n.shape[0], -1)
+    def temporal_features(self, q: torch.Tensor, r_idx: torch.Tensor):
+        """q [B, T, Q] raw joint positions of robot r_idx [B] -> node [B, N, dt + 1], edge [B, E, dt] features.
+        Nodes of the other robots and nodes without a DoF get zero trajectories and flag 0."""
+        qn = q[:, :, self.q_col.clamp_min(0)].float()                                     # [B, T, N]
+        qn = (2.0 * (qn - self.q_lo) / (self.q_hi - self.q_lo) - 1.0).clamp(-1.5, 1.5)
+        has = ((self.q_col >= 0).unsqueeze(0) & (self.gid.unsqueeze(0) == r_idx.unsqueeze(1))).float()   # [B, N]
+        qn = qn * has.unsqueeze(1)
+        dq = torch.cat([torch.zeros_like(qn[:, :1]), qn[:, 1:] - qn[:, :-1]], dim=1) * self.DELTA_SCALE
+        seq = torch.stack([qn, dq], dim=2).permute(0, 3, 2, 1)                             # [B, N, 2, T]
+        xt = torch.cat([self.node_tenc(seq), has.unsqueeze(-1)], dim=-1)
+        et = self.edge_tenc(torch.cat([seq[:, self.src], seq[:, self.dst]], dim=2))        # [B, E, dt]
+        return xt, et
+
+    def forward(self, e_task: torch.Tensor, q: Optional[torch.Tensor] = None,
+                r_idx: Optional[torch.Tensor] = None):
+        """Static: e_task [d_task] (one task) -> g [R, hidden], node embeddings [N, hidden].
+        Temporal: e_task [B, d_task], q [B, T, Q], r_idx [B] -> g [B, hidden] of each sample's robot, n [B, N, hidden]."""
+        if q is None:
+            n = self.in_proj(self.x if self.temporal_dim == 0 else
+                             torch.cat([self.x, self.x.new_zeros(self.x.shape[0], self.temporal_dim + 1)], dim=-1))
+            e = self.e if self.temporal_dim == 0 else torch.cat([self.e, self.e.new_zeros(self.e.shape[0], self.temporal_dim)], dim=-1)
+            e_task_nodes = e_task.unsqueeze(0).expand(n.shape[0], -1)
+        else:
+            if self.temporal_dim == 0:
+                raise ValueError("this GNN was built without temporal features (temporal_dim=0)")
+            xt, et = self.temporal_features(q, r_idx)
+            B = q.shape[0]
+            n = self.in_proj(torch.cat([self.x.unsqueeze(0).expand(B, -1, -1), xt.to(self.x.dtype)], dim=-1))
+            e = torch.cat([self.e.unsqueeze(0).expand(B, -1, -1), et.to(self.e.dtype)], dim=-1)
+            e_task_nodes = e_task.unsqueeze(1).expand(-1, n.shape[1], -1)
         for layer in self.layers:
-            n = layer(n, self.src, self.dst, self.e, e_task_nodes)
-        g = torch.zeros(self.num_graphs, n.shape[1], device=n.device, dtype=n.dtype)
-        g = g.index_add(0, self.gid, n) * self.inv_counts.unsqueeze(1)
-        return g, n
+            n = layer(n, self.src, self.dst, e, e_task_nodes)
+        if q is None:
+            g = torch.zeros(self.num_graphs, n.shape[1], device=n.device, dtype=n.dtype)
+            g = g.index_add(0, self.gid, n) * self.inv_counts.unsqueeze(1)
+            return g, n
+        g = torch.zeros(n.shape[0], self.num_graphs, n.shape[2], device=n.device, dtype=n.dtype)
+        g = g.index_add(1, self.gid, n) * self.inv_counts.view(1, -1, 1)
+        return g[torch.arange(n.shape[0], device=n.device), r_idx], n
+
+
+class NodeAttentionRouting(nn.Module):
+    """graph_routing=attn: c_m = sum_i a_mi W_v n_i, a_mi = softmax_i((W_h h_m)^T (W_n n_i) / sqrt(d)) over the robot's nodes."""
+
+    def __init__(self, d_h: int, d_n: int, d_out: int, heads: int = 1):
+        super().__init__()
+        if d_out % heads:
+            raise ValueError(f"graph_attn_heads={heads} must divide graph_hidden={d_out}")
+        self.heads, self.d = heads, d_out // heads
+        self.W_h = nn.Linear(d_h, d_out, bias=False)
+        self.W_n = nn.Linear(d_n, d_out, bias=False)
+        self.W_v = nn.Linear(d_n, d_out, bias=False)
+
+    def forward(self, h: torch.Tensor, n: torch.Tensor, mask: torch.Tensor):
+        """h [B, M, d_h], n [B, N, d_n], mask [B, N] (True: node of the sample's robot)
+        -> c [B, M, d_out], a [B, M, N] (mean over heads; exactly 0 on masked nodes)."""
+        B, M, _ = h.shape
+        N = n.shape[1]
+        qh = self.W_h(h).view(B, M, self.heads, self.d).transpose(1, 2)            # [B, H, M, d]
+        kn = self.W_n(n).view(B, N, self.heads, self.d).transpose(1, 2)            # [B, H, N, d]
+        vn = self.W_v(n).view(B, N, self.heads, self.d).transpose(1, 2)
+        logits = qh @ kn.transpose(-1, -2) / math.sqrt(self.d)                      # [B, H, M, N]
+        logits = logits.masked_fill(~mask[:, None, None, :], float("-inf"))
+        a = logits.softmax(-1)
+        c = (a @ vn).transpose(1, 2).reshape(B, M, self.heads * self.d)
+        return c, a.mean(1)
 
 
 # --------------------------------------------------------------------------- routing
 class RoutingCodebook(VectorQuantizer):
-    """Shared codebook addressed by attention instead of nearest neighbour.
-
-    forward(q):  alpha = softmax(q . W_K c / sqrt(d) / tau), z_soft = alpha @ C,
-                 idx = argmax alpha, z_hard = C[idx]   (usage counted on idx)
-    inference_forward(q): the argmax route, returned as (z_hard, idx, -logits) so the
-    stage-2 / stage-3 callers see the VectorQuantizer contract."""
+    """Codebook addressed by attention: alpha = softmax(q . W_K c / sqrt(d) / tau), z_soft = alpha @ C, z_hard = C[argmax];
+    inference_forward returns (z_hard, idx, -logits) like VectorQuantizer."""
 
     def __init__(self, num_latents: int, latent_dim: int, temperature: float = 1.0,
                  code_restart: bool = False, logit_scale_init: float = 10.0):
@@ -204,6 +294,12 @@ class GraphRoutedMotifLearning(ActionMotifLearning):
         route_temperature: float = 1.0,
         hard_training: bool = False,            # True: straight-through argmax code to the decoder
         decoder_cond: str = "graph",            # graph | none
+        morphology: str = "graph",              # graph: GNN over the kinematic graph | embed: free vector per robot (no graph)
+        graph_temporal: bool = False,           # nodes/edges also encode the window's joint trajectories (batch["qpos"])
+        graph_temporal_dim: int = 32,
+        qpos_layout: str = "./assets/kinematic_graphs/qpos_layout.json",   # data/process/build_qpos_layout.py
+        graph_routing: str = "pool",            # pool: q_m = W_Q[g; h_m] | attn: q_m = W_Q[h_m; c_m], c_m = attention over the joint nodes
+        graph_attn_heads: int = 1,
         code_restart: bool = False,
         num_primitives: int = 7,
         # causal effect head: Delta o over each token's span from z^skill only
@@ -224,16 +320,40 @@ class GraphRoutedMotifLearning(ActionMotifLearning):
                                   code_restart=code_restart)
         robots = dict(robots or DEFAULT_ROBOTS)
         self.robot_names = list(robots.keys())
-        graphs = load_graphs(graph_dir, self.robot_names)
-        self.gnn = TaskConditionedMPNN([graphs[r] for r in self.robot_names], task_dim,
-                                       hidden=graph_hidden, layers=graph_layers,
-                                       layer_norm=graph_layer_norm)
+        if morphology not in ("graph", "embed"):
+            raise ValueError(f"morphology must be graph|embed, got {morphology}")
+        self.morphology_mode = morphology
+        self.graph_temporal = bool(graph_temporal) and morphology == "graph"
+        if morphology == "graph":
+            graphs = load_graphs(graph_dir, self.robot_names)
+            layouts = None
+            if self.graph_temporal:
+                with open(qpos_layout) as f:
+                    lay = json.load(f)
+                layouts = [lay[r] for r in self.robot_names]
+            self.gnn = TaskConditionedMPNN([graphs[r] for r in self.robot_names], task_dim,
+                                           hidden=graph_hidden, layers=graph_layers,
+                                           layer_norm=graph_layer_norm,
+                                           temporal_dim=graph_temporal_dim if self.graph_temporal else 0,
+                                           qpos_layout=layouts)
+            self.task_embed = TaskTextEmbedder(task_dim, text_encoder=text_encoder)
+            self.node_names = [f"{r}/{n}" for r in self.robot_names for n in graphs[r].node_names]
+        else:                                   # ablation: a learned vector per robot replaces g_r (no graph, no task)
+            self.gnn = self.task_embed = None
+            self.embodiment_embed = nn.Embedding(len(self.robot_names), graph_hidden)
+            self.node_names = list(self.robot_names)
         emb2graph = torch.full((max(EMBODIMENT_TAG_MAPPING.values()) + 1,), -1, dtype=torch.long)
         for g_i, (name, tag) in enumerate(robots.items()):
             emb2graph[EMBODIMENT_TAG_MAPPING[tag]] = g_i
         self.register_buffer("emb2graph", emb2graph, persistent=False)
-        self.task_embed = TaskTextEmbedder(task_dim, text_encoder=text_encoder)
         self.route_query = nn.Linear(graph_hidden + latent_dim, latent_dim)
+        if graph_routing not in ("pool", "attn"):
+            raise ValueError(f"graph_routing must be pool|attn, got {graph_routing}")
+        if graph_routing == "attn" and morphology != "graph":
+            raise ValueError("graph_routing=attn needs morphology=graph (attention over the joint nodes)")
+        self.graph_routing = graph_routing
+        self.node_attn = (NodeAttentionRouting(latent_dim, graph_hidden, graph_hidden, graph_attn_heads)
+                          if graph_routing == "attn" else None)
         self.decoder_cond = decoder_cond
         if decoder_cond == "graph":
             self.dec_cond = nn.Linear(graph_hidden, latent_dim)
@@ -247,26 +367,50 @@ class GraphRoutedMotifLearning(ActionMotifLearning):
 
     # -- morphology -----------------------------------------------------------
     def morphology(self, embodiment_id: torch.Tensor, languages: List[str]) -> torch.Tensor:
-        """g_r per sample [B, graph_hidden]: one GNN pass per distinct instruction in
-        the batch over all robot graphs, then gather (robot, task) per sample."""
+        """g_r per sample [B, graph_hidden] (static graph)."""
+        return self.morphology_static(embodiment_id, languages)[0]
+
+    def morphology_static(self, embodiment_id: torch.Tensor, languages: List[str]):
+        """One GNN pass per distinct instruction, gathered per sample -> g_r [B, Dg], node embeddings [B, N, Dg]
+        (None unless the attention routing needs them), robot index r_idx [B]."""
         device = embodiment_id.device
-        uniq = list(dict.fromkeys(languages))
-        e_task = self.task_embed(uniq, device)                          # [U, d_task]
-        g_table = torch.stack([self.gnn(e_task[u])[0] for u in range(len(uniq))])  # [U, R, Dg]
-        u_idx = torch.tensor([uniq.index(l) for l in languages], device=device)
         r_idx = self.emb2graph[embodiment_id.long().view(-1)]
         if (r_idx < 0).any():
             bad = embodiment_id.view(-1)[r_idx < 0].unique().tolist()
             raise ValueError(f"no kinematic graph for embodiment ids {bad}")
-        return g_table[u_idx, r_idx]
+        if self.gnn is None:
+            return self.embodiment_embed(r_idx), None, r_idx
+        uniq = list(dict.fromkeys(languages))
+        e_task = self.task_embed(uniq, device)                          # [U, d_task]
+        outs = [self.gnn(e_task[u]) for u in range(len(uniq))]
+        g_table = torch.stack([o[0] for o in outs])                     # [U, R, Dg]
+        u_idx = torch.tensor([uniq.index(l) for l in languages], device=device)
+        nodes = torch.stack([o[1] for o in outs])[u_idx] if self.node_attn is not None else None   # [B, N, Dg]
+        return g_table[u_idx, r_idx], nodes, r_idx
+
+    def morphology_dynamic(self, embodiment_id: torch.Tensor, languages: List[str], qpos: torch.Tensor):
+        """graph_temporal: g [B, Dg] and node embeddings [B, N, Dg] from the graph carrying the window's qpos [B, T, Q]."""
+        device = embodiment_id.device
+        r_idx = self.emb2graph[embodiment_id.long().view(-1)]
+        e_task = self.task_embed(list(languages), device)               # [B, d_task]
+        return self.gnn(e_task, qpos, r_idx)
 
     # -- forward --------------------------------------------------------------
     def forward(self, batch: Dict[str, torch.Tensor], causal_attn: bool = False):
         progress, x = batch["progress"], batch["rel_state"]
         h = self.encoder(x, progress, causal=causal_attn)               # H_m  [B, M, D]
-        g = self.morphology(batch["embodiment_id"], batch["language"])  # g_r  [B, Dg]
-        g_tok = g.unsqueeze(1).expand(-1, h.shape[1], -1)
-        q = self.route_query(torch.cat([g_tok, h], dim=-1))             # q_m  [B, M, D]
+        g, nodes, r_idx = self.morphology_static(batch["embodiment_id"], batch["language"])  # g_r [B, Dg]
+        g_route = g
+        if self.graph_temporal:
+            if "qpos" not in batch:
+                raise ValueError("graph_temporal=true needs batch['qpos'] (dataset_maniskill_prim_q)")
+            g_route, nodes = self.morphology_dynamic(batch["embodiment_id"], batch["language"], batch["qpos"])
+        if self.node_attn is not None:                                  # attn: q_m = W_Q[h_m; c_m]
+            on_robot = self.gnn.gid.unsqueeze(0) == r_idx.unsqueeze(1)              # [B, N]
+            ctx, node_attn = self.node_attn(h, nodes, on_robot)
+        else:                                                           # pool: q_m = W_Q[g; h_m]
+            ctx, node_attn = g_route.unsqueeze(1).expand(-1, h.shape[1], -1), None
+        q = self.route_query(torch.cat([ctx, h], dim=-1))               # q_m  [B, M, D]
         z_soft, z_hard, alpha, idx, logits = self.vq(q)
 
         if self.hard_training:
@@ -285,7 +429,8 @@ class GraphRoutedMotifLearning(ActionMotifLearning):
         ent = -(alpha * (alpha + 1e-10).log()).sum(-1).mean()           # mean token entropy
         mean_alpha = alpha.reshape(-1, alpha.shape[-1]).mean(0)
         balance = (mean_alpha * (mean_alpha * alpha.shape[-1] + 1e-10).log()).sum()  # KL(mean || uniform)
-        out = dict(recon=recon, z_e=q, h=h, z_q=z_dec, z=z_hard, idx=idx, alpha=alpha, g=g,
+        out = dict(recon=recon, z_e=q, h=h, z_q=z_dec, z=z_hard, idx=idx, alpha=alpha, g=g_route, g_static=g,
+                   node_attn=node_attn,                                 # [B, M, N] with graph_routing=attn, else None
                    routing_entropy=ent, load_balance=balance,
                    alpha_max=alpha.max(-1).values.mean().detach(),
                    effect_pred=self.effect_head(z_dec))                 # [B, M, 3]
@@ -305,38 +450,6 @@ class GraphRoutedMotifLearning(ActionMotifLearning):
         (lambda_entropy sharpens alpha, lambda_balance spreads codebook usage)."""
         rec = ((x_hat - x) ** 2).mean()
         return {"loss": rec, "recon_loss": rec, "vq_loss": torch.zeros_like(rec)}
-
-
-# def object_displacement_targets(obj_rel: torch.Tensor, n_tokens: int, scale: float,
-#                                 clip: float) -> torch.Tensor:
-#     """obj_rel [B, H, 3] (metres, relative to the episode start) -> Delta o per token
-#     [B, M, 3]: object position at the end of token m's span minus at its start, scaled
-#     and clipped (one widowxai episode drops the object off the table)."""
-#     B, H, _ = obj_rel.shape
-#     ds = max(H // n_tokens, 1)
-#     start_idx = torch.arange(n_tokens, device=obj_rel.device) * ds
-#     end_idx = (start_idx + ds).clamp(max=H - 1)
-#     delta = obj_rel[:, end_idx] - obj_rel[:, start_idx]
-#     return (delta * scale).clamp(-clip, clip)
-
-
-# def effect_loss(effect_pred: torch.Tensor, obj_rel: torch.Tensor, obj_valid=None,
-#                 scale: float = 10.0, clip: float = 1.0):
-#     """L_effect = MSE(Delta o, f_effect(z^skill)) over valid samples; also returns the
-#     R^2 against the batch mean (0 = predicting the mean, 1 = perfect)."""
-#     target = object_displacement_targets(obj_rel, effect_pred.shape[1], scale, clip)
-#     if obj_valid is not None:
-#         w = obj_valid.reshape(obj_valid.shape[0], -1)[:, 0].float().view(-1, 1, 1)
-#     else:
-#         w = torch.ones(target.shape[0], 1, 1, device=target.device)
-#     se = ((effect_pred - target) ** 2) * w
-#     denom = (w.sum() * target.shape[1] * target.shape[2]).clamp_min(1.0)
-#     mse = se.sum() / denom
-#     with torch.no_grad():
-#         mean = (target * w).sum((0, 1), keepdim=True) / (w.sum() * target.shape[1]).clamp_min(1.0)
-#         var = (((target - mean) ** 2) * w).sum() / denom
-#         r2 = 1.0 - mse.detach() / var.clamp_min(1e-8)
-#     return mse, r2
 
 
 MODEL_REGISTRY = {"MOTIFStage1Graph": GraphRoutedMotifLearning}

@@ -77,12 +77,8 @@ def _quat_rotate(q, v):
 
 
 def parse_urdf(path: str, robot: str = None, bidirectional: bool = True) -> KinematicGraph:
-    """Joints -> nodes, consecutive-joint links -> edges 
-
-    Node 0 is the root link ("base", a fixed pseudo-joint). With `bidirectional`
-    every edge also gets a reversed copy (inverse transform, reverse flag = 1) so
-    messages reach the base and the fingertips see the arm. 
-    """
+    """Joints -> nodes (node 0 = root link), parent-child links -> edges; bidirectional adds the reversed
+    edge (inverse transform, reverse flag 1)."""
     root = ET.parse(path).getroot()
     robot = robot or root.get("name", os.path.basename(path))
     joints = []

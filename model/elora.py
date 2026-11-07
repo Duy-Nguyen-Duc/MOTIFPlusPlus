@@ -34,9 +34,7 @@ class ELoRALinear(nn.Module):
         self.B = nn.Parameter(torch.zeros(num_nodes, d_out, rank))
         for k in range(num_skills):
             nn.init.kaiming_uniform_(self.A[k], a=math.sqrt(5))
-        # save_base=False drops the wrapped frozen weights from state_dict() (used when the
-        # base model is a pretrained backbone that is reloaded from its own source).
-        self.save_base = True
+        self.save_base = True   # False: drop the frozen base weights from state_dict() (backbone reloaded from its source)
         hook = getattr(self, "register_state_dict_post_hook", None) or self._register_state_dict_hook
         hook(self._drop_base_hook)
 
@@ -47,7 +45,7 @@ class ELoRALinear(nn.Module):
                 state_dict.pop(k)
 
     @property
-    def weight(self):  
+    def weight(self):
         return self.base.weight
 
     @property
@@ -79,6 +77,8 @@ def inject_elora(root: nn.Module, targets: Iterable[str], ctx: ELoRAContext, num
                  num_nodes: int, rank: int = 4, scale: float = 1.0) -> List[str]:
     targets = tuple(targets)
     replaced = []
+    if not targets:                       # no adapters at all (frozen-backbone + projectors-only ablation)
+        return replaced
     for name, module in list(root.named_modules()):
         if not isinstance(module, nn.Linear) or isinstance(module, ELoRALinear):
             continue

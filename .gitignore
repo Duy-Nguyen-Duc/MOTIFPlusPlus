@@ -223,6 +223,8 @@ runs/
 demo_data_processed_obj/
 # regenerable by data/process/label_primitives.py, videos are symlinks
 demo_data_processed_prim/
+demo_data_processed_prim_q/
+demo_data_rs/
 
 # internal server/infra notes - not for the public repo
 AI_AGENTS_SETUP.md

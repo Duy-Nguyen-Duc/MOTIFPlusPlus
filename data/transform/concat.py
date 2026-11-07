@@ -180,19 +180,12 @@ class ConcatTransform(InvertibleModalityTransform):
             # TODO: Extract rel_state and progress if exist
             rel_state_keys = [k for k in action_keys if k.startswith("action.rel_state")]
             progress_keys = [k for k in action_keys if k.startswith("action.progress")]
-            # Gripper->object offset, present only in the object-augmented dataset
-            # (see data/process/append_object_action_dims.py). Routed to its own
-            # field like rel_state so it never enters the action target.
+            # side information routed to its own batch key, never part of the action target:
+            # ee_to_obj [T, 3], prim_id / prim_prog [T], obj_rel [T, 3] / obj_valid [T], qpos [T, Q]
             obj_keys = [k for k in action_keys if k.startswith("action.ee_to_obj")]
-            # Per-frame primitive labels (data/process/label_primitives.py):
-            # action.prim_id / action.prim_prog -> batch["prim_id"] / ["prim_prog"],
-            # shape [T] each. Side information for stage 1, never an action target.
             prim_keys = [k for k in action_keys if k.startswith("action.prim_")]
-            # Object trajectory (data/process/append_object_rel.py): action.obj_rel [T, 3]
-            # (metres, relative to the episode's first frame) and action.obj_valid [T]
-            # -> batch["obj_rel"] / batch["obj_valid"]. Targets of the causal effect
-            # loss in the graph stage 1; never part of the action target.
             objrel_keys = [k for k in action_keys if k.startswith("action.obj_")]
+            qpos_keys = [k for k in action_keys if k.startswith("action.qpos")]
             if rel_state_keys:
                 data["rel_state"] = torch.cat(
                     [data.pop(key) for key in rel_state_keys], dim=-1
@@ -210,11 +203,13 @@ class ConcatTransform(InvertibleModalityTransform):
             for key in objrel_keys:
                 v = data.pop(key)
                 data[key.replace("action.", "")] = v.squeeze(-1) if v.shape[-1] == 1 else v
+            if qpos_keys:
+                data["qpos"] = torch.cat([data.pop(key) for key in qpos_keys], dim=-1)
             # Concatenate the action keys
             # We'll have StateActionToTensor before this transform, so here we use torch.cat
             data["action"] = torch.cat(
                 [data.pop(key) for key in self.action_concat_order
-                 if key not in rel_state_keys + progress_keys + obj_keys + prim_keys + objrel_keys], dim=-1
+                 if key not in rel_state_keys + progress_keys + obj_keys + prim_keys + objrel_keys + qpos_keys], dim=-1
             )  # [T, D_action]
 
         return data

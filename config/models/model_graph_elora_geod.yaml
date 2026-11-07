@@ -30,6 +30,12 @@ stage1:
   route_temperature: 1.0
   hard_training: false          # the chain trains with hard routing (models.stage1.hard_training=true)
   decoder_cond: graph
+  morphology: graph             # graph | embed (ablation: learned per-robot vector, no kinematic graph)
+  graph_temporal: false         # ablation: nodes/edges also encode the window's joint trajectories (needs dataset_maniskill_prim_q)
+  graph_temporal_dim: 32
+  qpos_layout: ./assets/kinematic_graphs/qpos_layout.json
+  graph_routing: pool           # pool: q_m = W_Q[g; h_m] | attn: motif token attends over the robot's joint nodes, q_m = W_Q[h_m; c_m] (code -> joint map)
+  graph_attn_heads: 1
   code_restart: false
   effect_scale: 100.0
   effect_hidden: 256

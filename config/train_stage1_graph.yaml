@@ -20,8 +20,6 @@ add_latent_action: false
 lambda_entropy: 0.01
 lambda_balance: 0.1
 entropy_ramp_epochs: 3
-lambda_effect: 0.0            # causal effect loss, off
-effect_clip: 1.0
 
 add_info_NCE: true
 lambda_infonce: 0.1

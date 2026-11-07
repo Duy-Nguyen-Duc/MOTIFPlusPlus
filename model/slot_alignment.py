@@ -1,20 +1,14 @@
-"""Optional slot-wise cross-embodiment alignment; legacy InfoNCE stays unchanged."""
 import torch
 import torch.nn.functional as F
 
 
 def compute_slot_cross_robot_infonce(
     z_e, languages, progress, embodiment_ids, num_slots=3,
-    tau=0.1, sigma=0.02, max_progress_delta=0.04,
+    tau=0.1, sigma=0.02, max_progress_delta=0.04, slot_weight=None,
 ):
-    """Align corresponding slots across robots within a supported task/phase.
-
-    Pool time inside each slot, never across slots. Positives require matching
-    language, different embodiment and progress distance <= max_progress_delta.
-    Gaussian weights retain the legacy progress preference inside this window.
-    All non-self samples are denominator candidates. Unsupported anchors are
-    excluded; an unsupported batch returns a differentiable zero.
-    """
+    """Slot-wise InfoNCE across robots: time pooled inside each slot; positives share the task, differ in embodiment
+    and lie within max_progress_delta (Gaussian progress weights); anchors without a positive are dropped, a batch
+    without any returns a differentiable zero. slot_weight [B, S] weights each anchor's slot terms (idle slots)."""
     b, tokens, dim = z_e.shape
     if tokens % num_slots or tau <= 0 or sigma <= 0 or max_progress_delta <= 0:
         raise ValueError("Invalid slot shape or contrastive scale")
@@ -42,8 +36,13 @@ def compute_slot_cross_robot_infonce(
         # Select supported rows before logsumexp to avoid all--inf gradients.
         logits = sim[:, valid, :]
         log_weights = (-(dp / sigma).square()).masked_fill(~positive, -torch.inf)
-        per_slot = (torch.logsumexp(logits, -1) -
-                    torch.logsumexp(logits + log_weights[valid][None], -1)).mean(1)
+        per_anchor = (torch.logsumexp(logits, -1) -
+                      torch.logsumexp(logits + log_weights[valid][None], -1))   # [S, n_valid]
+        if slot_weight is None:
+            per_slot = per_anchor.mean(1)
+        else:
+            w = slot_weight.reshape(b, num_slots).float()[valid].t()             # [S, n_valid]
+            per_slot = (per_anchor * w).sum(1) / w.sum(1).clamp_min(1e-6)
         loss = per_slot.mean()
     stats["slot_infonce_loss"] = loss.detach()
     for slot in range(num_slots):

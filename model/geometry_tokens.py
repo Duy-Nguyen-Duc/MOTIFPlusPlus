@@ -43,8 +43,7 @@ class GeometryTokens(nn.Module):
         for i, e in enumerate(ids):
             emb2robot[e] = i
         self.robot_names = names
-        # Effective intrinsics after the data pipeline's crop 
-        # (train: random crop of crop_scale, eval: centre crop) and resize to image_size. 
+        # intrinsics after the pipeline's crop (crop_scale) and resize to image_size
         crop = int(source_size * crop_scale)
         s = image_size / crop
         off = (source_size - crop) / 2.0
@@ -63,7 +62,7 @@ class GeometryTokens(nn.Module):
         v, u = torch.meshgrid(centres, centres, indexing="ij")                    # row-major like the ViT
         pix = torch.stack([u.flatten(), v.flatten(), torch.ones(n_side * n_side)], dim=-1)   # [N, 3]
         rays = torch.stack([pix @ torch.linalg.inv(k).T for k in K])              # [R, N, 3], z = 1
-        self.register_buffer("emb2robot", emb2robot)
+        self.register_buffer("emb2robot", emb2robot, persistent=False)   # not saved: length follows EMBODIMENT_TAG_MAPPING
         self.register_buffer("T_tcp_cam", torch.stack(T))                         # [R, 4, 4]
         self.register_buffer("rays_cam", rays)
         freqs = (2.0 ** torch.arange(num_freq, dtype=torch.float32)) * math.pi
@@ -73,12 +72,11 @@ class GeometryTokens(nn.Module):
         nn.init.zeros_(self.proj[-1].weight)
         nn.init.zeros_(self.proj[-1].bias)
         object.__setattr__(self, "_depth_net", None)
-        self.last_points = None  
+        self.last_points = None
 
     # -- geometry ---------------------------------------------------------------------------
     def _depth(self, wrist: torch.Tensor) -> torch.Tensor:
-        """Frozen monocular depth of the wrist image [B, 3, H, W] in [0, 1] -> per-patch z-depth [B, N]
-        (relative scale; the caller anchors it)."""
+        """Frozen monocular depth of the wrist image [B, 3, H, W] -> per-patch relative z-depth [B, N]."""
         if self._depth_net is None:
             from transformers import AutoModelForDepthEstimation
             net = AutoModelForDepthEstimation.from_pretrained(self.depth_model).eval()

@@ -81,6 +81,35 @@ def quat_wxyz_to_matrix(q):
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
 
 
+def pose_matrix(raw_pose):
+    """ManiSkill raw pose [x, y, z, qw, qx, qy, qz] -> 4x4."""
+    raw = np.asarray(raw_pose.cpu() if hasattr(raw_pose, 'cpu') else raw_pose, dtype=float).reshape(7)
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = quat_wxyz_to_matrix(raw[3:7]), raw[:3]
+    return T
+
+
+def absolute_ee_pose_mode(robot_uid):
+    """X-VLA baseline: every arm needs `pd_ee_pose` (absolute ee-link target in the root frame, Euler XYZ, unnormalised).
+    The Panda and xArm6 ship one; the WidowX AI only has the delta mode, so it gets the same controller with use_delta off."""
+    if not robot_uid.startswith('widowxai'):
+        return
+    from copy import deepcopy
+    from mani_skill.agents.robots.widowxai.widowxai import WidowXAI
+    orig = WidowXAI._controller_configs.fget
+
+    def patched(self):
+        cfg = orig(self)
+        if 'pd_ee_pose' not in cfg:
+            arm = deepcopy(cfg['pd_ee_delta_pose']['arm'])
+            arm.use_delta, arm.normalize_action = False, False
+            arm.pos_lower = arm.pos_upper = arm.rot_lower = arm.rot_upper = None
+            cfg['pd_ee_pose'] = dict(cfg['pd_ee_delta_pose'], arm=arm)
+        return cfg
+    WidowXAI._controller_configs = property(patched)
+
+
+
 def color_mask(rgb, color):
     r, g, b = [rgb[..., i].astype(np.int32) for i in range(3)]
     if color == 'red':
@@ -369,26 +398,47 @@ def run_pair(args):
     if episode_file.exists() or trace_file.exists():
         raise RuntimeError('Partial pair exists; inspect before resuming in a fresh directory')
     manifest = json.loads(Path(args.manifest).read_text())
-    policy = InferenceWrapper(Path(args.checkpoint), device='cuda:0')
-    policy.set_robot_uid(ROBOT_UID_TO_POLICY_UID[robot])
-    head = policy.model.flow_matching_head
-    assert head.num_inference_timesteps == 4 and head.action_horizon == EXEC_HORIZON
+    xvla = None
+    if args.policy == 'xvla':                                 # X-VLA baseline (eval/xvla_adapter.py): absolute ee targets, no steering
+        if args.steer > 0:
+            raise SystemExit('the X-VLA baseline is evaluated without steering')
+        from scipy.spatial.transform import Rotation
+        from eval.xvla_adapter import XVLAPolicy
+        xvla = XVLAPolicy(Path(args.checkpoint), _robot_key(robot), device='cuda:0')
+        absolute_ee_pose_mode(robot)
+    else:
+        policy = InferenceWrapper(Path(args.checkpoint), device='cuda:0')
+        policy.set_robot_uid(ROBOT_UID_TO_POLICY_UID[robot])
+        head = policy.model.flow_matching_head
+        assert head.num_inference_timesteps == 4 and head.action_horizon == EXEC_HORIZON
     env = CPUGymWrapper(gym.make(
         task, obs_mode='rgb', robot_uids=robot,
         sim_config=dict(control_freq=20, sim_freq=100),
         sensor_configs=dict(shader_pack='default', width=256, height=256),
         human_render_camera_configs=dict(shader_pack='default'),
         viewer_camera_configs=dict(shader_pack='default'), render_mode='rgb_array',
-        control_mode='pd_ee_delta_pose'))
+        control_mode='pd_ee_pose' if xvla is not None else 'pd_ee_delta_pose'))
     env.unwrapped.print_sim_details()
     steer = Steering(robot, task, args.steer) if args.steer > 0 else None
 
     def predict(element, seed):
         with torch.random.fork_rng(devices=[0]), torch.inference_mode():
             torch.manual_seed(seed)
+            if xvla is not None:
+                return xvla.predict(element['video.image'][0], element['video.wrist_image'][0],
+                                    np.concatenate([element['state.position'][0], element['state.rotation'][0]]),
+                                    element['annotation.human.task_description'][0])
             return policy.get_action(element)
 
     def executable(chunk, obs):
+        if xvla is not None:              # absolute tcp targets (world) -> pd_ee_pose: ee link in the root frame, Euler XYZ, gripper command
+            pos, quat, closed = chunk
+            rows = []
+            for p, q, c in zip(pos[:EXEC_HORIZON], quat[:EXEC_HORIZON], closed[:EXEC_HORIZON]):
+                T = T_root_inv @ pose_matrix(np.concatenate([p, q])) @ T_tcp_ee
+                rows.append(np.concatenate([T[:3, 3], Rotation.from_matrix(T[:3, :3]).as_euler('XYZ'),
+                                            np.full(ACTION_GRIPPER_DIMS[_robot_key(robot)], xvla.gripper_command(c))]))
+            return np.asarray(rows, dtype=np.float32)
         g = np.asarray(chunk['action.gripper']).reshape(EXEC_HORIZON, -1)
         assert g.shape[1] == ACTION_GRIPPER_DIMS[_robot_key(robot)]
         pos = np.asarray(chunk['action.position'])
@@ -409,6 +459,10 @@ def run_pair(args):
                 env.action_space.seed(seed)
                 env.step(env.action_space.sample())
                 obs, info = env.reset(seed=seed)
+                if xvla is not None:          # robot root and the fixed tcp -> ee-link offset (identity on the Panda)
+                    ag = env.unwrapped.agent
+                    T_root_inv = np.linalg.inv(pose_matrix(ag.robot.pose.raw_pose[0]))
+                    T_tcp_ee = np.linalg.inv(pose_matrix(ag.tcp.pose.raw_pose[0])) @ pose_matrix(ag.controller.controllers['arm'].ee_link.pose.raw_pose[0])
                 reset_s = time.perf_counter() - start
                 infer_s = step_s = 0.0
                 successes = terminated_success = False
@@ -464,7 +518,8 @@ def run_pair(args):
     result = dict(robot=robot, task=task, success_rate=n_succ / len(episodes), successes=n_succ,
                   num_per_task=len(episodes), few_shot=True, policy_seed=POLICY_SEED, seed_base=SEED_BASE,
                   request_seed_scheme='sha256-v1', checkpoint_sha256=manifest['checkpoint_sha256'],
-                  replan_steps=EXEC_HORIZON, denoising_steps=4, step_budget=args.step_limit or STEP_LENGTHS[task],
+                  replan_steps=EXEC_HORIZON, denoising_steps=(xvla.steps if xvla is not None else 4), policy=(xvla.info if xvla is not None else 'motif'),
+                  step_budget=args.step_limit or STEP_LENGTHS[task],
                   steering=steering_spec(args.steer), renderer_icd=os.environ.get('VK_ICD_FILENAMES'),
                   success_termination_mismatches=sum(x['success'] != x['terminated'] for x in episodes),
                   total_seconds=time.perf_counter() - total_start, replay_exact=True)
@@ -510,12 +565,15 @@ def stage(name, ckpt, out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', type=Path, help='stage-3 checkpoint (config.json and experiment_cfg beside it)')
+    ap.add_argument('--policy', choices=['motif', 'xvla'], default='motif',
+                    help='xvla = X-VLA baseline checkpoint directory (eval/xvla_adapter.py): absolute pd_ee_pose control, no steering')
     ap.add_argument('--name', help='run name: results in <out>/<name>/')
     ap.add_argument('--out', type=Path)
     ap.add_argument('--steer', type=float, default=1.0, help='steering gain k; 0 = policy alone')
     ap.add_argument('--episodes', type=int, default=50)
     ap.add_argument('--pairs', nargs='+', type=int, default=None, help='indices into the pair list (default: all)')
     ap.add_argument('--all-pairs', action='store_true', help='all 18 robot x task pairs instead of the 6 transfer pairs')
+    ap.add_argument('--reuse', help='name of a finished run of the same checkpoint and steering whose per-pair results are copied instead of re-run')
     ap.add_argument('--workers', type=int, default=3)
     ap.add_argument('--retries', type=int, default=6, help='re-run pairs that did not finish (renderer / quota incidents)')
     ap.add_argument('--wait', type=int, default=600, help='seconds between retries')
@@ -538,24 +596,36 @@ def main():
                OPENBLAS_NUM_THREADS='2', LP_NUM_THREADS='8', PYTHONPATH=f'{REPO}:{MANISKILL}',
                VK_ICD_FILENAMES=str(VK / 'lvp_icd.json'), MS_RENDER_BACKEND='pci:0', XDG_RUNTIME_DIR=str(xdg),
                LD_LIBRARY_PATH=f'{VK}/usr/lib/x86_64-linux-gnu:{VK}/lib/x86_64-linux-gnu:' + os.environ.get('LD_LIBRARY_PATH', ''))
-    digest = sha256(ckpt)
-    staged = stage(args.name, ckpt, out)
+    digest = sha256(ckpt / 'model.safetensors' if args.policy == 'xvla' else ckpt)
+    staged = stage(args.name, ckpt, out) if args.policy == 'motif' else ckpt      # X-VLA checkpoints are HF directories
     manifest = out / f'{args.name}_manifest.json'
     manifest.write_text(json.dumps({
         'checkpoint': str(staged), 'source_checkpoint': str(ckpt), 'checkpoint_sha256': digest,
         'code_manifest_sha256': 'live-repo+run_percept_steering.py', 'experiment': args.name,
-        'execution_protocol': {'replan_steps': EXEC_HORIZON, 'denoising_steps': 4, 'seed_base': SEED_BASE,
+        'execution_protocol': {'replan_steps': EXEC_HORIZON, 'denoising_steps': (10 if args.policy == 'xvla' else 4), 'seed_base': SEED_BASE,
                                'policy_seed': POLICY_SEED, 'steering': steering_spec(args.steer)}}, indent=2) + '\n')
     dest = out / args.name
     dest.mkdir(parents=True, exist_ok=True)
     (out / 'logs').mkdir(exist_ok=True)
+    if args.reuse:                                   # e.g. the Transfer run's 6 pairs inside the Global (all-pairs) run
+        prev = REPO / 'eval_results' / args.reuse
+        pm = json.loads((prev / f'{args.reuse}_manifest.json').read_text())
+        if pm.get('checkpoint_sha256') != digest or pm['execution_protocol'].get('steering') != steering_spec(args.steer):
+            raise SystemExit(f'--reuse {args.reuse}: checkpoint or steering differs from this run')
+        n = 0
+        for robot, task in pairs:
+            for src in (prev / args.reuse).glob(f'{robot}__{task}.*'):
+                if not (dest / src.name).exists():
+                    shutil.copy2(src, dest / src.name)
+                    n += 1
+        print(f'{args.name}: reused {n} file(s) from {prev / args.reuse}', flush=True)
 
     def run(job):
         robot, task = job
         if (dest / f'{robot}__{task}.json').exists():
             return f'{robot}/{task}: already done'
         cmd = [sys.executable, str(Path(__file__).resolve()), '--pair', robot, task, '--checkpoint', str(staged),
-               '--manifest', str(manifest), '--out', str(dest), '--episodes', str(args.episodes), '--steer', str(args.steer)]
+               '--manifest', str(manifest), '--out', str(dest), '--episodes', str(args.episodes), '--steer', str(args.steer), '--policy', args.policy]
         if args.step_limit:
             cmd += ['--step-limit', str(args.step_limit)]
         t0 = time.time()
@@ -589,7 +659,7 @@ def main():
                          split='transfer' if (robot, task) in PAIRS else 'seen'))
     summary = dict(name=args.name, checkpoint=str(ckpt), sha256=digest, episodes=sum(r['episodes'] for r in rows),
                    successes=sum(r['successes'] for r in rows), rows=rows, minutes=round((time.time() - t0) / 60, 1),
-                   steering=steering_spec(args.steer))
+                   steering=steering_spec(args.steer), reused_from=args.reuse)
     for split in ('transfer', 'seen'):
         sub = [r for r in rows if r['split'] == split]
         if sub:

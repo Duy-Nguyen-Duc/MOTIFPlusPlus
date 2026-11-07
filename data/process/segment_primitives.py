@@ -21,6 +21,7 @@ V_MOVE = 4e-4                 # m/step: the arm counts as moving above 0.4 mm/st
 W_MOVE = np.deg2rad(0.15)
 MIN_SEG_LEN = 5e-3            # segments shorter than 5 mm and 3 deg are settling after gripper events
 MIN_SEG_ROT = np.deg2rad(3)
+SPLIT_AT_GRIPPER = False      # also cut motion segments at gripper events (teleop demos move while closing)
 
 
 def quat_wxyz_to_rot(q):
@@ -100,6 +101,8 @@ def segment_episode(robot, task, ep):
             if sp[j] < 0.15 and sp[j] < 0.3 * min(sp[p1], sp[p2]):
                 cuts.append(s + j)
         cuts.append(e)
+        if SPLIT_AT_GRIPPER:
+            cuts = sorted(set(cuts) | {int(t) for t in gchg if s < t < e})
         for a, b in zip(cuts[:-1], cuts[1:]):
             path = v[a:b].sum()
             rang = (rot[b] * rot[a].inv()).magnitude()

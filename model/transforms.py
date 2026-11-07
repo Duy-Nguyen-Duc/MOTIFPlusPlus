@@ -149,9 +149,7 @@ class GR00TTransform(InvertibleModalityTransform):
             if modality not in grouped_keys:
                 grouped_keys[modality] = []
             grouped_keys[modality].append(key)
-        # Use video key to determine batch size. Stage 1 can run without the video
-        # modality at all (it consumes only rel_state/progress/language/embodiment_id),
-        # in which case fall back to the state key, which is always present.
+        # batch size from the video key; stage 1 drops the video modality, then from the state key
         if "video" in data:
             video_ndim = data["video"].ndim
             if video_ndim == 5:  # Interpret as [T, V, H, W, C]
@@ -312,9 +310,7 @@ class GR00TTransform(InvertibleModalityTransform):
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
-        # 1) Prepare video and language with vlm processing.
-        # Video is optional: stage 1 drops the modality entirely so the loader does
-        # not decode and augment frames it never reads (see build_dataset drop_video).
+        # 1) Prepare video and language with vlm processing. Video is optional: stage 1 drops the modality.
         language = self._prepare_language(data)
         if "video" in data:
             images = self._prepare_video(data)  # v t c h w
@@ -346,21 +342,20 @@ class GR00TTransform(InvertibleModalityTransform):
             transformed_data["rel_state"] = data['rel_state']
         if "progress" in data:
             transformed_data["progress"] = data['progress']
-        # Gripper->object offset: present only with the object-augmented
-        # dataset, consumed by the stage-2 trace auxiliary.
+        # side information of the extended data configs: ee_to_obj (*_obj), tcp_pose (*_geo),
+        # obj_rel / obj_valid (*_prim_obj), prim_id / prim_prog (*_prim), qpos (*_prim_q)
         if "ee_to_obj" in data:
             transformed_data["ee_to_obj"] = data["ee_to_obj"]
-        # Raw tcp pose (world, p + q_wxyz) for the stage-3 geometry tokens (*_geo data configs).
         if "tcp_pose" in data:
             transformed_data["tcp_pose"] = data["tcp_pose"]
-        # Object trajectory for the causal effect loss (*_rel_prim_obj data configs).
         for key in ("obj_rel", "obj_valid"):
             if key in data:
                 transformed_data[key] = data[key]
-        # Primitive labels, present only with the *_rel_prim data configs.
         for key in ("prim_id", "prim_prog"):
             if key in data:
                 transformed_data[key] = data[key]
+        if "qpos" in data:
+            transformed_data["qpos"] = data["qpos"]
 
         for k, v in vlm_outputs.items():
             assert k not in transformed_data, f"Key {k} already exists in transformed_data."

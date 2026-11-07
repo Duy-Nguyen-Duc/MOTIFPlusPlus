@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import wandb
 
 from model.stage1 import compute_cross_robot_infonce, LabelRemapper
-from model.stage1_graph import effect_loss
 from model.stage1_factorized import ConditionalEmbodimentDiscriminator
 from model.stage1_graph import build_model, TASK_IDS
 from model.primitive_tying import PRIMITIVES, frames_to_tokens
@@ -28,17 +27,21 @@ log = logging.getLogger(__name__)
 
 
 class RoutingReport:
-    """Per-epoch: code usage, alpha sharpness, soft/hard recon gap, code purity."""
+    """Per-epoch: code usage, alpha sharpness, soft/hard recon gap, code purity; with graph_routing=attn also
+    the code -> joint attention table (mean a_mi of the tokens routed to each code)."""
 
-    def __init__(self, codebook_size: int, num_primitives: int, device):
+    def __init__(self, codebook_size: int, num_primitives: int, device, node_names=None):
         self.K, self.P = codebook_size, num_primitives
         self.code_prim = torch.zeros(codebook_size, num_primitives, device=device)
+        self.node_names = node_names
+        self.code_node = self.code_cnt = None
         self.reset()
 
     def reset(self):
         self.code_prim.zero_()
+        self.code_node = self.code_cnt = None
         self.sums = {"entropy": 0.0, "alpha_max": 0.0, "balance": 0.0, "recon": 0.0, "recon_hard": 0.0,
-                     "effect": 0.0, "effect_r2": 0.0}
+                     "attn_entropy": 0.0, "attn_max": 0.0}
         self.n = 0
 
     @torch.no_grad()
@@ -53,6 +56,18 @@ class RoutingReport:
         if prim_tok is not None:
             flat = out["idx"].reshape(-1) * self.P + prim_tok.reshape(-1)
             self.code_prim += torch.bincount(flat, minlength=self.K * self.P).view(self.K, self.P).float()
+        a = out.get("node_attn")
+        if a is not None:
+            a = a.detach().float().reshape(-1, a.shape[-1])                      # [B*M, N], 0 off-robot
+            idx = out["idx"].reshape(-1)
+            if self.code_node is None:
+                self.code_node = torch.zeros(self.K, a.shape[1], device=a.device)
+                self.code_cnt = torch.zeros(self.K, device=a.device)
+            self.code_node.index_add_(0, idx, a)
+            self.code_cnt += torch.bincount(idx, minlength=self.K).float()
+            n_robot = (a > 0).sum(-1).clamp_min(2).float()                        # entropy normalised by log(#robot nodes)
+            self.sums["attn_entropy"] += float((-(a * (a + 1e-10).log()).sum(-1) / n_robot.log()).mean())
+            self.sums["attn_max"] += float(a.max(-1).values.mean())
 
     def summary(self):
         s = {k: v / max(self.n, 1) for k, v in self.sums.items()}
@@ -74,7 +89,21 @@ class RoutingReport:
             s["per_primitive"] = per_prim
             top = self.code_prim.argmax(1)
             s["code_majority_primitive"] = {int(k): PRIMITIVES[int(top[k])] for k in range(self.K) if usage[k] > 0}
+        if self.code_node is None:
+            s.pop("attn_entropy"), s.pop("attn_max")
+        else:
+            tab = self.code_node / self.code_cnt.clamp_min(1.0).unsqueeze(1)
+            names = self.node_names or [str(i) for i in range(tab.shape[1])]
+            s["code_joints"] = {int(k): [[names[int(i)], round(float(tab[k, i]), 3)] for i in tab[k].topk(3).indices]
+                                for k in range(self.K) if self.code_cnt[k] > 0}
         return s
+
+    def attn_table(self):
+        """Full code x node attention table of the epoch (routing/attn_epoch_XXXX.json), None without attention."""
+        if self.code_node is None:
+            return None
+        tab = self.code_node / self.code_cnt.clamp_min(1.0).unsqueeze(1)
+        return {"node_names": self.node_names, "code_count": self.code_cnt.tolist(), "code_node": tab.tolist()}
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="train_stage1_graph")
@@ -123,7 +152,7 @@ def main(cfg: DictConfig):
     optim, sched = build_optim_sched(model, cfg.optim, cfg.train.get("scheduler_epochs", cfg.train.epochs),
                                      sched_steps_per_epoch(cfg.train, loader))
     count_params_B(model)
-    report = RoutingReport(model.codebook_size, model.num_primitives, device)
+    report = RoutingReport(model.codebook_size, model.num_primitives, device, getattr(model, "node_names", None))
 
     global_iters, start_epoch = 0, 1
     resume_from = cfg.train.get("resume_from")
@@ -167,17 +196,6 @@ def main(cfg: DictConfig):
             outputs["loss"] = (outputs["loss"]
                                + float(cfg.get("lambda_entropy", 0.0)) * ent_ramp * out["routing_entropy"]
                                + float(cfg.get("lambda_balance", 0.0)) * out["load_balance"])
-
-            # causal effect loss (off in this experiment)
-            lambda_effect = float(cfg.get("lambda_effect", 0.0))
-            if lambda_effect > 0:
-                if "obj_rel" not in batch:
-                    raise ValueError("lambda_effect > 0 needs batch['obj_rel'] (dataset=dataset_maniskill_prim_obj)")
-                eff, eff_r2 = effect_loss(out["effect_pred"], batch["obj_rel"], batch.get("obj_valid"),
-                                          scale=model.effect_scale, clip=float(cfg.get("effect_clip", 1.0)))
-                outputs["loss"] += lambda_effect * eff
-                outputs["effect_loss"], outputs["effect_r2"] = eff.detach(), eff_r2
-                report.sums["effect"] += float(eff); report.sums["effect_r2"] += float(eff_r2)
 
             # primitive labels per token
             prim_tok = out.get("prim_tok")
@@ -266,11 +284,10 @@ def main(cfg: DictConfig):
                 }
                 if "recon_hard" in out:
                     payload["recon_hard"] = float(((out["recon_hard"] - target) ** 2).mean())
+                if out.get("node_attn") is not None:
+                    payload["attn_max"] = float(out["node_attn"].max(-1).values.mean())
                 if infonce_loss is not None:
                     payload["infonce_loss"] = float(infonce_loss)
-                if "effect_loss" in outputs:
-                    payload["effect_loss"] = float(outputs["effect_loss"])
-                    payload["effect_r2"] = float(outputs["effect_r2"])
                 if "adv_loss" in outputs:
                     payload["adv_loss"] = float(outputs["adv_loss"])
                     payload["adv_acc"] = float(outputs["adv_acc"])
@@ -298,6 +315,9 @@ def main(cfg: DictConfig):
         summary = report.summary()
         with open(os.path.join(report_dir, f"epoch_{epoch:04d}.json"), "w") as f:
             json.dump(summary, f, indent=2)
+        if report.attn_table() is not None:
+            with open(os.path.join(report_dir, f"attn_epoch_{epoch:04d}.json"), "w") as f:
+                json.dump(report.attn_table(), f)
         epoch_payload = {
             "epoch": epoch, "avg_loss": total_loss / max(1, n_seen), "time": time.time() - t0,
             "lr": optim.param_groups[0]["lr"], "grad_norm": grad_norm,
@@ -306,6 +326,7 @@ def main(cfg: DictConfig):
             "routing_entropy_epoch": summary["entropy"], "alpha_max_epoch": summary["alpha_max"],
             "recon_epoch": summary["recon"], "recon_hard_epoch": summary["recon_hard"],
             "code_purity": summary.get("code_purity"),
+            "attn_entropy": summary.get("attn_entropy"), "attn_max": summary.get("attn_max"),
         }
         if infonce_n:
             epoch_payload["infonce_loss_epoch"] = infonce_sum / infonce_n

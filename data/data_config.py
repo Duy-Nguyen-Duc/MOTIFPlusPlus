@@ -362,31 +362,19 @@ class PiperEndposeDataConfig(BaseDataConfig):
 ###########################################################################################
 
 class PANDAWithRELObjDataConfig(PANDAWithRELDataConfig):
-    """RELData plus the gripper->object offset (action.ee_to_obj).
-
-    Opt-in: only embodiments registered as *_rel_obj load the extra dims, and
-    they exist only in the object-augmented dataset built by
-    data/process/append_object_action_dims.py. Every other arm is unaffected.
-    """
+    """*_rel + the gripper->object offset action.ee_to_obj (data/process/append_object_action_dims.py)."""
     action_keys = PANDAWithRELDataConfig.action_keys + ["action.ee_to_obj"]
 
 
 class PANDAWithRELPrimDataConfig(PANDAWithRELDataConfig):
-    """RELData plus per-frame primitive labels (action.prim_id, action.prim_prog).
-
-    Opt-in like *_rel_obj: only embodiments registered as *_rel_prim load the
-    two columns, which exist only in the dataset built by
-    data/process/label_primitives.py. The concat transform routes them to
-    batch["prim_id"] / batch["prim_prog"]; they are not normalized and never
-    enter the action target.
-    """
+    """*_rel + per-frame primitive labels action.prim_id / action.prim_prog (data/process/label_primitives.py),
+    routed to batch["prim_id"] / batch["prim_prog"], never normalised."""
     action_keys = PANDAWithRELDataConfig.action_keys + ["action.prim_id", "action.prim_prog"]
     no_norm_action_keys = ("action.progress", "action.prim_id", "action.prim_prog")
 
 
 class PANDAWithRELPrimGeoDataConfig(PANDAWithRELPrimDataConfig):
-    """*_rel_prim + the raw tcp pose in batch["tcp_pose"] (data/transform/tcp_pose.py) for the
-    stage-3 geometry tokens (model/geometry_tokens.py). Normalised state/action unchanged."""
+    """*_rel_prim + the raw tcp pose in batch["tcp_pose"] for the stage-3 geometry tokens."""
 
     def transform(self):
         from data.transform.tcp_pose import TcpPosePassthrough
@@ -397,47 +385,29 @@ class PANDAWithRELPrimGeoDataConfig(PANDAWithRELPrimDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
-class PANDAWithRELPrimObjDataConfig(PANDAWithRELPrimDataConfig):
-    """RELPrim plus the manipulated object's trajectory (action.obj_rel, action.obj_valid).
+class PANDAWithRELPrimQDataConfig(PANDAWithRELPrimDataConfig):
+    """*_rel_prim + the window's raw joint positions in batch["qpos"] [T, Q] (data/process/append_qpos.py) for the
+    motion-aware kinematic graph, which normalises them by the joint limits (qpos_layout.json)."""
+    action_keys = PANDAWithRELPrimDataConfig.action_keys + ["action.qpos"]
+    no_norm_action_keys = PANDAWithRELPrimDataConfig.no_norm_action_keys + ("action.qpos",)
 
-    Opt-in like *_rel_prim: only *_rel_prim_obj embodiments load the columns, which
-    exist only in the dataset built by data/process/append_object_rel.py. Kept in
-    raw metres (no normalisation): the causal effect loss scales and clips them
-    itself, so one outlier episode cannot squash every other robot's range.
-    """
+
+class PANDAWithRELPrimObjDataConfig(PANDAWithRELPrimDataConfig):
+    """*_rel_prim + the object trajectory action.obj_rel / action.obj_valid (data/process/append_object_rel.py), raw metres."""
     action_keys = PANDAWithRELPrimDataConfig.action_keys + ["action.obj_rel", "action.obj_valid"]
     no_norm_action_keys = PANDAWithRELPrimDataConfig.no_norm_action_keys + (
         "action.obj_rel", "action.obj_valid")
 
 
 class PANDAWithRELPrimObjEEDataConfig(PANDAWithRELPrimObjDataConfig):
-    """RELPrimObj plus the gripper->object offset of every frame (action.ee_to_obj).
-
-    Built by data/process/append_object_rel.py --ee-to-obj (demo_data_processed_prim_obj_ee).
-    Raw metres, no normalisation; concat.py routes it to batch["ee_to_obj"] [T, 3] for the
-    stage-3 auxiliary object-offset loss (flow head aux_obj_weight).
-    """
+    """*_rel_prim_obj + the per-frame gripper->object offset action.ee_to_obj (append_object_rel.py --ee-to-obj), raw metres."""
     action_keys = PANDAWithRELPrimObjDataConfig.action_keys + ["action.ee_to_obj"]
     no_norm_action_keys = PANDAWithRELPrimObjDataConfig.no_norm_action_keys + ("action.ee_to_obj",)
 
 
 class PANDAWithRELPairDataConfig(PANDAWithRELDataConfig):
-    """Two observation timesteps instead of one, for the DINO-target stage 1.
-
-    That stage defines a motif as the change between O_t and O_{t+k}, so the
-    batch has to carry both frames; every other config in this file returns
-    `observation_indices = [0]` and images shaped [B, v, t=1, ...].
-
-    Only the VIDEO modality takes the pair. State and language stay at [0]:
-    stage 1 reads neither at t=1, `batch["language"]` is consumed as one string
-    per sample by the InfoNCE term and the conditional discriminator, and a
-    second index would silently turn both into length-2 sequences.
-
-    PAIR_DELTA is in dataset steps. Demos were recorded at 20 Hz, so 20 steps is
-    the ~1 second UniVLA calibrates its latent actions to. Near the end of an
-    episode the loader clamps, which makes the target the final frame -- i.e. a
-    smaller observed change, which is correct.
-    """
+    """Video frames [0, PAIR_DELTA] for the DINO-target stage 1 (motif = change O_t -> O_{t+k}); state and language
+    stay at [0]. PAIR_DELTA = 20 steps = ~1 s at 20 Hz; the loader clamps near the episode end."""
     PAIR_DELTA = 20
     observation_indices = [0]      # state / language / GR00TTransform horizon
 
@@ -451,19 +421,7 @@ class PANDAWithRELPairDataConfig(PANDAWithRELDataConfig):
 
 
 class PANDAWithRELPairBaseDataConfig(PANDAWithRELPairDataConfig):
-    """Frame pair, BASE CAMERA ONLY -- for the grounded stage 1.
-
-    That stage's visual FDM reads `images[:, view_index, 0]` and `[:, view_index, 1]`
-    with view_index=0, and nothing else in stage 1 touches images at all. With
-    both views the wrist camera is read from the frame cache, cropped, resized,
-    colour-jittered, collated and copied to the GPU on every sample, and then
-    never indexed.
-
-    Dropping it halves the image bytes per sample (2.4 -> 1.2 MB), which halves
-    the /dev/shm footprint, the pfss read volume and the augmentation CPU. It
-    changes nothing the model sees. Stage 2 keeps both views -- its perceiver
-    consumes them -- via dataset_maniskill_contact_s2.yaml.
-    """
+    """Frame pair, base camera only: the grounded stage 1 reads images[:, 0] alone, so the wrist view is not loaded."""
     video_keys = ["video.image"]
 
 
@@ -485,6 +443,25 @@ DATA_CONFIG_MAP = {
     'panda_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
     'xarm6_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
     'widowxai_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'rs_panda_rel': PANDAWithRELDataConfig(),
+    'rs_panda_rel_prim': PANDAWithRELPrimDataConfig(),
+    'rs_panda_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'rs_iiwa_rel': PANDAWithRELDataConfig(),
+    'rs_iiwa_rel_prim': PANDAWithRELPrimDataConfig(),
+    'rs_iiwa_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'rs_ur5e_rel': PANDAWithRELDataConfig(),
+    'rs_ur5e_rel_prim': PANDAWithRELPrimDataConfig(),
+    'rs_ur5e_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'rs_kinova3_rel': PANDAWithRELDataConfig(),
+    'rs_kinova3_rel_prim': PANDAWithRELPrimDataConfig(),
+    'rs_kinova3_rel_prim_geo': PANDAWithRELPrimGeoDataConfig(),
+    'panda_rel_prim_q': PANDAWithRELPrimQDataConfig(),
+    'xarm6_rel_prim_q': PANDAWithRELPrimQDataConfig(),
+    'widowxai_rel_prim_q': PANDAWithRELPrimQDataConfig(),
+    'rs_panda_rel_prim_q': PANDAWithRELPrimQDataConfig(),
+    'rs_iiwa_rel_prim_q': PANDAWithRELPrimQDataConfig(),
+    'rs_ur5e_rel_prim_q': PANDAWithRELPrimQDataConfig(),
+    'rs_kinova3_rel_prim_q': PANDAWithRELPrimQDataConfig(),
     'panda_rel_prim_obj': PANDAWithRELPrimObjDataConfig(),
     'xarm6_rel_prim_obj': PANDAWithRELPrimObjDataConfig(),
     'widowxai_rel_prim_obj': PANDAWithRELPrimObjDataConfig(),
