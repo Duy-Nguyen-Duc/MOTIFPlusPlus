@@ -11,11 +11,15 @@ bad() { echo "  FAIL $*"; fail=1; }
 export PYTHONPATH=$ROOT PYTHONNOUSERSITE=1
 
 echo "python / torch"
-python - <<'PY' && ok "torch cu124 import" || bad "torch import"
-import sys, torch
+TORCH=${TORCH:-2.6.0}   # same override as setup_env.sh (reference build 2.6.0+cu124)
+TORCH=$TORCH python - <<'PY' && ok "torch $TORCH import + CUDA matmul" || bad "torch import / CUDA"
+import os, sys, torch
 assert sys.version_info[:2] == (3, 10), sys.version
-assert torch.__version__.startswith("2.6.0"), torch.__version__
+assert torch.__version__.startswith(os.environ["TORCH"]), torch.__version__
 print("   ", torch.__version__, "cuda available:", torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+assert torch.cuda.is_available()
+x = torch.randn(256, 256, device="cuda"); assert torch.allclose((x @ x.T).cpu(), x.cpu() @ x.cpu().T, atol=1e-2)   # kernels exist for this GPU
+if not torch.__version__.startswith("2.6.0"): print("    WARN not the reference torch build (2.6.0+cu124); results differ within the per-seed spread")
 PY
 python - <<'PY' && ok "repository imports + CPU forward of the temporal-graph stage 1" || bad "repository imports"
 import torch, model.stage1_graph as s1, model.stage3_elora, model.geometry_tokens, data.data_config as dc
@@ -31,11 +35,13 @@ echo "ManiSkill fork"
 c=$(git -C "$MANISKILL_ROOT" rev-parse HEAD 2> /dev/null); [ "$c" = 52e1eb21dbe1fee29d18df223dc913d06b043481 ] && ok "commit $c" || bad "commit $c != 52e1eb21"
 git -C "$MANISKILL_ROOT" apply --reverse --check "$PATCH" 2> /dev/null && ok "renderer patch applied" || bad "renderer patch not applied"
 python -c "import mani_skill, os; p = os.path.realpath(mani_skill.__file__); assert p.startswith(os.path.realpath('$MANISKILL_ROOT')), p" 2> /dev/null && ok "mani_skill imports from the fork" || bad "mani_skill imports from elsewhere"
+python -c "import eval_maniskill.eval_motif_maniskill" 2> /dev/null && ok "benchmark worker imports (pynvml, profiler)" || bad "eval_maniskill.eval_motif_maniskill does not import (pip install pynvml?)"
 for r in panda_wristcam xarm6_robotiq_wristcam widowxai_wristcam; do
   python -c "import mani_skill.agents.robots; from mani_skill.agents.registration import REGISTERED_AGENTS as R; assert '$r' in R, list(R)[:5]" 2> /dev/null && ok "robot $r registered" || bad "robot $r missing"
 done
 A=${MS_ASSET_DIR:-$HOME/.maniskill}
 [ -f "$A/data/robots/widowxai/wxai_base.urdf" ] && ok "widowxai asset" || bad "widowxai asset missing: python -m mani_skill.utils.download_asset -y widowxai"
+[ -f "$A/data/robots/widowxai/meshes/base_link.stl.convex.stl" ] && ok "widowxai convex hulls" || bad "widowxai convex hulls missing: python data/process/make_convex_hulls.py --urdf $A/data/robots/widowxai/wxai_follower.urdf"
 [ -d "$A/data/robots/xarm6" ] && ok "xarm6 asset" || bad "xarm6 asset missing: python -m mani_skill.utils.download_asset -y xarm6"
 
 echo "repository assets"

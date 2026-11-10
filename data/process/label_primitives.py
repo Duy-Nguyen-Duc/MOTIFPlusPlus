@@ -102,7 +102,13 @@ def build_robot(src: Path, dst: Path, robot: str, seg: dict) -> dict:
     if not (d / "videos").exists():
         os.symlink((s / "videos").resolve(), d / "videos")
 
-    st_stats = json.load(open(s / "meta/stats.json"))["observation.state"]
+    stats_path = s / "meta/stats.json"
+    if not stats_path.exists():
+        # data/dataset.py writes meta/stats.json lazily the first time a dataset is loaded for training; a fresh
+        # prepare_data.sh run reaches this step before any training, so compute it here the same way.
+        json.dump(calculate_dataset_statistics(sorted((s / "data").rglob("episode_*.parquet"))), open(stats_path, "w"), indent=4)
+        shutil.copy2(stats_path, d / "meta" / stats_path.name)
+    st_stats = json.load(open(stats_path))["observation.state"]
     g_range = max(float(st_stats["max"][7]) - float(st_stats["min"][7]), 1e-6)
 
     eps = [json.loads(l) for l in open(s / "meta/episodes.jsonl")]

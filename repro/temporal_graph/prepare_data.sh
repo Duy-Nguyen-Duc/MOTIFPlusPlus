@@ -4,7 +4,8 @@
 #   labels -> (graph check) -> joint trajectories -> frame cache.
 #   MANISKILL_ROOT=../ManiSkill VK_FALLBACK_ROOT=<lavapipe root> bash repro/temporal_graph/prepare_data.sh
 # Variables: RAW (demo_data/maniskill_h5), NUM_TRAJ (50 per robot-task pair), NUM_PROCS (10), REPLAY_ENVS (10),
-# ROBOTS, TASKS, REBUILD_GRAPHS=1 (rebuild graphs + qpos layout from the fork's URDFs and diff against the committed files).
+# ROBOTS, TASKS, REBUILD_GRAPHS=1 (rebuild graphs + qpos layout from the fork's URDFs and diff against the committed files),
+# STOP_AFTER=replay (exit after generate + replay: run one instance per robot in parallel, then the full script once).
 # To start from transferred demos put them at $RAW (generate + replay are then skipped).
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd); cd "$ROOT"
@@ -19,6 +20,9 @@ if [ -n "${VK_FALLBACK_ROOT:-}" ]; then   # software renderer, same variables ev
          LD_LIBRARY_PATH=$VK_FALLBACK_ROOT/usr/lib/x86_64-linux-gnu:$VK_FALLBACK_ROOT/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
 fi
 export MS_RENDER_BACKEND=${MS_RENDER_BACKEND:-pci:0} LP_NUM_THREADS=${LP_NUM_THREADS:-8} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-$(mktemp -d)}
+# BLAS / OpenMP threads per worker as eval/run_percept_steering.py sets them: the replay pool (REPLAY_ENVS workers) and the
+# NUM_PROCS planners otherwise each start one thread per core (~440 threads per worker on a 224-core host, 20x slower).
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-2} MKL_NUM_THREADS=${MKL_NUM_THREADS:-2} OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
 log() { echo "[$(date -u '+%F %T')] data $*"; }
 gripper_idx() { case $1 in panda) echo 7,8;; xarm6) echo 6;; widowxai) echo 6,7;; *) echo "no gripper columns known for $1" >&2; exit 1;; esac; }
 
@@ -35,6 +39,7 @@ for r in $ROBOTS; do for t in $TASKS; do
       --save-traj --num-envs "$REPLAY_ENVS" -b physx_cpu
   fi
 done; done
+[ "${STOP_AFTER:-}" = replay ] && { log "STOP_AFTER=replay: raw demos for $ROBOTS ready"; exit 0; }
 
 for r in $ROBOTS; do
   [ -f "demo_data/lerobot/$r/meta/episodes.jsonl" ] && continue

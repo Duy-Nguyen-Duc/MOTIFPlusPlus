@@ -115,7 +115,36 @@ Static-graph control and the other ablations use the same chain with other overr
 on top of the temporal graph = joint-attentive routing, `morphology=embed` = no graph, `prim_conditioning=false ...` = no
 primitive labels.
 
-## 4. What is and is not reproduced bit-exactly
+## 4. Notes from the second reproduction (RunPod, RTX PRO 6000 Blackwell, 2026-11-07)
+
+Results of that run (seed 42, demos regenerated on this machine, torch 2.8.0+cu128, two chains sharing one GPU):
+
+| K | Transfer | +steer | Global | +steer | wall time (data ready -> CHAIN_DONE) |
+|---|---|---|---|---|---|
+| 5 (reference, A100) | 218/300 | 246/300 | 719/900 | 706/900 | ~34 h |
+| 10 | 236/300 | 262/300 | 725/900 | 721/900 | 49 h |
+| 50 | 269/300 | 273/300 | 746/900 | 716/900 | 57.5 h |
+
+Steering on seen pairs again costs most on Panda PullCube (50 -> 23 at K=10, 50 -> 12 at K=50) and WidowX PlaceSphere (18 -> 0, 33 -> 1).
+
+Problems met on a fresh machine and what now handles them (all scripts stay idempotent):
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| torch 2.6.0+cu124 cannot run on the GPU | Blackwell (sm_120) needs cu128 kernels | `TORCH=2.8.0 TORCHVISION=0.23.0 TORCHCODEC=0.7.0 CUDA_TAG=cu128 bash repro/temporal_graph/setup_env.sh`; `TORCH=2.8.0 bash repro/temporal_graph/check_setup.sh`. Not the reference build: expect the per-seed spread, not identical numbers. |
+| `import mani_skill` fails: `No module named 'IPython'` / `'dacite'` | fork installed with `--no-deps`, both were missing from the pins | `ipython==8.39.0`, `dacite==1.9.2` added to `requirements.txt` |
+| WidowX AI demos: `Could not load resource .../base_link.stl.convex.stl`, then `Found errors in the Convex mesh: The mesh is not watertight` | the WidowX asset ships no convex hulls (Panda / xArm6 do); mplib 0.1.1 does not generate them, and hulls with near-duplicate vertices (< 1e-5 m) collapse in its STL loader | `data/process/make_convex_hulls.py` (hull of vertices snapped to a 1e-4 grid), run by `setup_env.sh` after the asset download, checked by `check_setup.sh` |
+| replay at 25-30 s per step, load average > 500 | each of the 10 replay-pool workers (and planners) started one BLAS/OpenMP thread per core (~440 threads per worker on 224 cores) | `prepare_data.sh` exports `OMP_NUM_THREADS=MKL_NUM_THREADS=OPENBLAS_NUM_THREADS=2`, as `eval/run_percept_steering.py` already did for its workers (~15x faster) |
+| benchmark workers pointed at a non-existent `lvp_icd.json` when lavapipe is installed with root | `eval/run_percept_steering.py` always derived the ICD from `VK_FALLBACK_ROOT` | with `VK_FALLBACK_ROOT` unset the workers inherit `VK_ICD_FILENAMES` (root install) or the system Vulkan device |
+| sapien hangs at start when no Vulkan ICD is visible | the container's NVIDIA driver has no Vulkan ICD | always export `VK_ICD_FILENAMES` (or `VK_FALLBACK_ROOT`) for generation, replay and evaluation |
+| `label_primitives.py`: `FileNotFoundError: demo_data_processed/panda/meta/stats.json` | `meta/stats.json` is written lazily by `data/dataset.py` the first time a dataset is loaded for training, so it existed on the authors' disk but not on a fresh `prepare_data.sh` run | `label_primitives.py` computes it with `calculate_dataset_statistics` when it is missing |
+| every benchmark worker exits with rc=1 after ~1 min: `ModuleNotFoundError: No module named 'pynvml'` | `eval_maniskill/eval_motif_maniskill.py` imports ManiSkill's benchmarking profiler, which imports `pynvml`; the fork is installed with `--no-deps`, so nothing pulled it in | `pynvml==13.0.1` pinned in `requirements.txt` (the eval runner retries by itself after 600 s once it is installed) |
+| benchmark episodes 20x slower (env step ~1.2 s instead of 0.07 s) while `top` shows the CPUs mostly idle | the container has a cgroup CPU quota (`/sys/fs/cgroup/cpu.max`, 23.8 cores here) far below the visible core count; another job with ~150 runnable threads takes the fair share and our workers are throttled (`cpu.stat` nr_throttled climbs every period) | nothing to fix in the code; size thread counts to the quota and expect eval wall time to follow the neighbour's load |
+
+`STOP_AFTER=replay ROBOTS=<robot> bash repro/temporal_graph/prepare_data.sh` runs one robot's generate + replay, so the three
+robots can run in parallel on a many-core host; the plain `prepare_data.sh` afterwards does the rest.
+
+## 5. What is and is not reproduced bit-exactly
 
 Fixed: data pipeline, K selection, seeds (training 42, env 2025-2074, policy 7, SHA-256 request seeds), epochs, batch x
 accumulation, window sizes, optimiser configs (`config/optim`), eval protocol, renderer (software lavapipe), pinned
@@ -124,7 +153,7 @@ kernels (cuDNN / index_add are nondeterministic; `_deterministic_kernels` only g
 library versions (lavapipe 23.2.1 here). Expect the same numbers within the per-seed spread (a few successes out of 300),
 not identical rollouts.
 
-## 5. Files
+## 6. Files
 
 | | |
 |---|---|
@@ -134,6 +163,8 @@ not identical rollouts.
 | `repro/temporal_graph/prepare_data.sh` | generate -> replay -> convert -> canonicalize -> segment -> label -> qpos -> frame cache |
 | `repro/temporal_graph/run_experiment.sh` | the chain per K, sequential sweep, result summary |
 | `repro/temporal_graph/requirements.txt`, `maniskill-renderer.patch` | pins |
+| `data/process/make_convex_hulls.py` | convex collision hulls for the WidowX AI asset (motion planning) |
+| `repro/temporal_graph/upload_checkpoints.py` | uploads the final stage 1/2/3 checkpoints, their configs and the eval summaries for K=10 / K=50 to a Hugging Face model repo (edit `HF_REPO` / `HF_TOKEN` at the top) |
 | `model/stage1_graph.py` | `TemporalEncoder`, `TaskConditionedMPNN(temporal_dim, qpos_layout)`, `morphology_dynamic` |
 | `data/process/build_qpos_layout.py`, `append_qpos.py`, `data/transform/concat.py`, `data/data_config.py` (`*_rel_prim_q`) | joint trajectories into `batch["qpos"]` |
 | `config/dataset/dataset_maniskill_prim_q.yaml`, `config/models/model_graph_elora_geod.yaml` (`graph_temporal`, `graph_temporal_dim`, `qpos_layout`) | configuration |

@@ -27,7 +27,9 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
 MANISKILL = Path(os.environ.get('MANISKILL_ROOT', REPO.parent / 'ManiSkill'))   # ManiSkill checkout with the CPU renderer patch
-VK = Path(os.environ.get('VK_FALLBACK_ROOT', '/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/.tmp_motif_install/vkfallback/root'))
+VK = Path(os.environ['VK_FALLBACK_ROOT']) if os.environ.get('VK_FALLBACK_ROOT') else None   # no-root lavapipe layout
+# (repro/temporal_graph/vulkan_lavapipe_norooot.sh); unset: the workers inherit VK_ICD_FILENAMES (system lavapipe) or the
+# default Vulkan device
 CALIB = REPO / 'assets/wrist_camera/wrist_cameras.json'
 
 PAIRS = [
@@ -594,8 +596,10 @@ def main():
     xdg.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = dict(os.environ, PYTHONNOUSERSITE='1', PYTHONUNBUFFERED='1', OMP_NUM_THREADS='2', MKL_NUM_THREADS='2',
                OPENBLAS_NUM_THREADS='2', LP_NUM_THREADS='8', PYTHONPATH=f'{REPO}:{MANISKILL}',
-               VK_ICD_FILENAMES=str(VK / 'lvp_icd.json'), MS_RENDER_BACKEND='pci:0', XDG_RUNTIME_DIR=str(xdg),
-               LD_LIBRARY_PATH=f'{VK}/usr/lib/x86_64-linux-gnu:{VK}/lib/x86_64-linux-gnu:' + os.environ.get('LD_LIBRARY_PATH', ''))
+               MS_RENDER_BACKEND='pci:0', XDG_RUNTIME_DIR=str(xdg))
+    if VK is not None:
+        env.update(VK_ICD_FILENAMES=str(VK / 'lvp_icd.json'),
+                   LD_LIBRARY_PATH=f'{VK}/usr/lib/x86_64-linux-gnu:{VK}/lib/x86_64-linux-gnu:' + os.environ.get('LD_LIBRARY_PATH', ''))
     digest = sha256(ckpt / 'model.safetensors' if args.policy == 'xvla' else ckpt)
     staged = stage(args.name, ckpt, out) if args.policy == 'motif' else ckpt      # X-VLA checkpoints are HF directories
     manifest = out / f'{args.name}_manifest.json'
